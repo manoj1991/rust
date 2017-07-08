@@ -30,6 +30,11 @@ extern crate syntax;
 
 extern crate serialize as rustc_serialize; // used by deriving
 
+#[macro_use]
+#[no_link]
+extern crate rustc_bitflags;
+
+mod apfloat;
 mod float;
 mod int;
 mod us;
