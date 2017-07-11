@@ -11,6 +11,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::i32;
+use std::marker::PhantomData;
 use std::ops::{Neg, Add, Sub, Mul, Div, Rem};
 use std::ops::{AddAssign, SubAssign, MulAssign, DivAssign, RemAssign};
 use std::str::FromStr;
@@ -71,8 +72,11 @@ bitflags! {
 pub struct ParseError(&'static str);
 
 // \c ilogb error results.
+#[allow(unused)]
 const IEK_ZERO: i32 = i32::MIN + 1;
+#[allow(unused)]
 const IEK_NAN: i32 = i32::MIN;
+#[allow(unused)]
 const IEK_INF: i32 = i32::MAX;
 
 /// A self-contained host- and target-independent arbitrary-precision
@@ -537,5 +541,432 @@ macro_rules! proxy_impls {
                 self
             }
         }
+    }
+}
+
+/// A signed type to represent a floating point number's unbiased exponent.
+type ExpInt = i16;
+
+/// Represents floating point arithmetic semantics.
+pub trait IeeeSemantics: Copy + Clone + Ord + fmt::Debug {
+    /// Number of bits in the exponent.
+    const EXPONENT_BITS: usize;
+
+    /// The largest E such that 2^E is representable; this matches the
+    /// definition of IEEE 754.
+    const MAX_EXPONENT: ExpInt = (1 << (Self::EXPONENT_BITS - 1)) - 1;
+
+    /// The smallest E such that 2^E is a normalized number; this
+    /// matches the definition of IEEE 754.
+    const MIN_EXPONENT: ExpInt = -(1 << (Self::EXPONENT_BITS - 1)) + 2;
+
+    /// Number of bits in the significand. This includes the integer bit.
+    const PRECISION: usize;
+}
+
+#[derive(Copy, Clone, PartialOrd, Debug)]
+pub struct Ieee<S: IeeeSemantics> {
+    marker: PhantomData<S>,
+}
+
+macro_rules! ieee_semantics {
+    ($($name:ident { $($items:tt)* })*) => {
+        mod ieee_semantics {
+            use super::{ExpInt, IeeeSemantics};
+
+            $(
+                // FIXME(eddyb) Remove most of these by manual impls
+                // on the structs parameterized by S: IeeeSemantics.
+                #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+                pub struct $name;
+                impl IeeeSemantics for $name { $($items)* }
+            )*
+        }
+
+        $(pub type $name = Ieee<ieee_semantics::$name>;)*
+    }
+}
+
+ieee_semantics! {
+    IeeeHalf { const EXPONENT_BITS: usize = 5; const PRECISION: usize = 11; }
+    IeeeSingle { const EXPONENT_BITS: usize = 8; const PRECISION: usize = 24; }
+    IeeeDouble { const EXPONENT_BITS: usize = 11; const PRECISION: usize = 53; }
+    IeeeQuad { const EXPONENT_BITS: usize = 15; const PRECISION: usize = 113; }
+    X87DoubleExtended { const EXPONENT_BITS: usize = 15; const PRECISION: usize = 64; }
+
+    // These are legacy semantics for the fallback, inaccrurate implementation of
+    // IBM double-double, if the accurate PpcDoubleDouble doesn't handle the
+    // operation. It's equivalent to having an IEEE number with consecutive 106
+    // bits of mantissa and 11 bits of exponent.
+    //
+    // It's not equivalent to IBM double-double. For example, a legit IBM
+    // double-double, 1 + epsilon:
+    //
+    //   1 + epsilon = 1 + (1 >> 1076)
+    //
+    // is not representable by a consecutive 106 bits of mantissa.
+    //
+    // Currently, these semantics are used in the following way:
+    //
+    //   PpcDoubleDouble -> (IeeeDouble, IeeeDouble) ->
+    //   (64 bits, 64 bits) -> (128 bits) ->
+    //   PpcDoubleDoubleLegacy -> IEEE operations
+    //
+    // We use to_bits() to get the bit representation of the
+    // underlying IeeeDouble, then construct the legacy IEEE float.
+    //
+    // FIXME: Implement all operations in PpcDoubleDouble, and delete these
+    // semantics.
+    PpcDoubleDoubleLegacy {
+        const EXPONENT_BITS: usize = 11;
+        const MIN_EXPONENT: ExpInt = -1022 + 53;
+        const PRECISION: usize = 53 + 53;
+    }
+}
+
+proxy_impls!([S: IeeeSemantics] Ieee<S>);
+
+/// Prints this value as a decimal string.
+///
+/// \param precision The maximum number of digits of
+///   precision to output. If there are fewer digits available,
+///   zero padding will not be used unless the value is
+///   integral and small enough to be expressed in
+///   precision digits. 0 means to use the natural
+///   precision of the number.
+/// \param width The maximum number of zeros to
+///   consider inserting before falling back to scientific
+///   notation. 0 means to always use scientific notation.
+///
+/// \param alternate Indicate whether to remove the trailing zero in
+///   fraction part or not. Also setting this parameter to true forces
+///   producing of output more similar to default printf behavior.
+///   Specifically the lower e is used as exponent delimiter and exponent
+///   always contains no less than two digits.
+///
+/// Number       precision    width      Result
+/// ------       ---------    -----      ------
+/// 1.01E+4              5        2       10100
+/// 1.01E+4              4        2       1.01E+4
+/// 1.01E+4              5        1       1.01E+4
+/// 1.01E-2              5        2       0.0101
+/// 1.01E-2              4        2       0.0101
+/// 1.01E-2              4        1       1.01E-2
+#[allow(unused)]
+impl<S: IeeeSemantics> fmt::Display for Ieee<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let frac_digits = f.precision().unwrap_or(0);
+        let width = f.width().unwrap_or(3);
+        let alternate = f.alternate();
+        panic!("NYI Display::fmt");
+    }
+}
+
+#[allow(unused)]
+impl<S: IeeeSemantics> Float for Ieee<S> {
+    fn zero() -> Self {
+        panic!("NYI zero")
+    }
+
+    fn inf() -> Self {
+        panic!("NYI inf")
+    }
+
+    fn qnan(payload: Option<u128>) -> Self {
+        panic!("NYI qnan")
+    }
+
+    fn snan(payload: Option<u128>) -> Self {
+        panic!("NYI snan")
+    }
+
+    fn largest() -> Self {
+        panic!("NYI largest")
+    }
+
+    fn smallest() -> Self {
+        panic!("NYI smallest")
+    }
+
+    fn smallest_normalized() -> Self {
+        panic!("NYI smallest_normalized")
+    }
+
+    fn add_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
+        panic!("NYI add_rounded")
+    }
+
+    fn mul_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
+        panic!("NYI mul_rounded")
+    }
+
+    fn div_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
+        panic!("NYI div_rounded")
+    }
+
+    fn remainder(&mut self, rhs: Self) -> OpStatus {
+        panic!("NYI remainder")
+    }
+
+    fn modulo(&mut self, rhs: Self) -> OpStatus {
+        panic!("NYI modulo")
+    }
+
+    fn fused_mul_add(&mut self, multiplicand: Self, addend: Self, round: Round) -> OpStatus {
+        panic!("NYI fused_mul_add")
+    }
+
+    fn round_to_integral(self, round: Round) -> (Self, OpStatus) {
+        panic!("NYI round_to_integral")
+    }
+
+    fn next_up(&mut self) -> OpStatus {
+        panic!("NYI next_up")
+    }
+
+    fn change_sign(&mut self) {
+        panic!("NYI change_sign")
+    }
+
+    fn from_bits(input: u128) -> Self {
+        panic!("NYI from_bits")
+    }
+
+    fn from_u128(input: u128, round: Round) -> (Self, OpStatus) {
+        panic!("NYI from_u128")
+    }
+
+    fn from_str_rounded(s: &str, round: Round) -> Result<(Self, OpStatus), ParseError> {
+        panic!("NYI from_str_rounded")
+    }
+
+    fn to_bits(self) -> u128 {
+        panic!("NYI to_bits")
+    }
+
+    fn to_u128(self, width: usize, round: Round, is_exact: &mut bool) -> (u128, OpStatus) {
+        panic!("NYI to_u128");
+    }
+
+    fn cmp_abs_normal(self, rhs: Self) -> Ordering {
+        panic!("NYI cmp_abs_normal")
+    }
+
+    fn bitwise_eq(self, rhs: Self) -> bool {
+        panic!("NYI bitwise_eq")
+    }
+
+    fn is_negative(self) -> bool {
+        panic!("NYI is_negative")
+    }
+
+    fn is_denormal(self) -> bool {
+        panic!("NYI is_denormal")
+    }
+
+    fn is_signaling(self) -> bool {
+        panic!("NYI is_signaling")
+    }
+
+    fn category(self) -> Category {
+        panic!("NYI category")
+    }
+
+    fn is_smallest(self) -> bool {
+        panic!("NYI is_smallest")
+    }
+
+    fn is_largest(self) -> bool {
+        panic!("NYI is_largest")
+    }
+
+    fn is_integer(self) -> bool {
+        panic!("NYI is_integer")
+    }
+
+    fn get_exact_inverse(self) -> Option<Self> {
+        panic!("NYI get_exact_inverse")
+    }
+
+    fn ilogb(self) -> i32 {
+        panic!("NYI ilogb")
+    }
+
+    fn scalbn(self, exp: i32, round: Round) -> Self {
+        panic!("NYI scalbn")
+    }
+
+    fn frexp(self, exp: &mut i32, round: Round) -> Self {
+        panic!("NYI frexp")
+    }
+}
+
+#[allow(unused)]
+impl<S: IeeeSemantics> Ieee<S> {
+    /// IEEE::convert - convert a value of one floating point type to another.
+    /// The return value corresponds to the IEEE754 exceptions. *loses_info
+    /// records whether the transformation lost information, i.e. whether
+    /// converting the result back to the original type will produce the
+    /// original value (this is almost the same as return value==OpStatus::OK,
+    /// but there are edge cases where this is not so).
+    pub fn convert<T: IeeeSemantics>(
+        self,
+        round: Round,
+        loses_info: &mut bool,
+    ) -> (Ieee<T>, OpStatus) {
+        panic!("NYI convert");
+    }
+}
+
+#[derive(Copy, Clone, PartialOrd, Debug)]
+pub struct IeeePair<S: IeeeSemantics>(Ieee<S>, Ieee<S>);
+
+pub type PpcDoubleDouble = IeeePair<ieee_semantics::IeeeDouble>;
+
+proxy_impls!([S: IeeeSemantics] IeeePair<S>);
+
+#[allow(unused)]
+impl<S: IeeeSemantics> fmt::Display for IeeePair<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        panic!("NYI Display::fmt");
+    }
+}
+
+#[allow(unused)]
+impl<S: IeeeSemantics> Float for IeeePair<S> {
+    fn zero() -> Self {
+        panic!("NYI zero")
+    }
+
+    fn inf() -> Self {
+        panic!("NYI inf")
+    }
+
+    fn qnan(payload: Option<u128>) -> Self {
+        panic!("NYI qnan")
+    }
+
+    fn snan(payload: Option<u128>) -> Self {
+        panic!("NYI snan")
+    }
+
+    fn largest() -> Self {
+        panic!("NYI largest")
+    }
+
+    fn smallest() -> Self {
+        panic!("NYI smallest")
+    }
+
+    fn smallest_normalized() -> Self {
+        panic!("NYI smallest_normalized")
+    }
+
+    fn add_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
+        panic!("NYI add_rounded")
+    }
+
+    fn mul_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
+        panic!("NYI mul_rounded")
+    }
+
+    fn div_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
+        panic!("NYI div_rounded")
+    }
+
+    fn remainder(&mut self, rhs: Self) -> OpStatus {
+        panic!("NYI remainder")
+    }
+
+    fn modulo(&mut self, rhs: Self) -> OpStatus {
+        panic!("NYI modulo")
+    }
+
+    fn fused_mul_add(&mut self, multiplicand: Self, addend: Self, round: Round) -> OpStatus {
+        panic!("NYI fused_mul_add")
+    }
+
+    fn round_to_integral(self, round: Round) -> (Self, OpStatus) {
+        panic!("NYI round_to_integral")
+    }
+
+    fn next_up(&mut self) -> OpStatus {
+        panic!("NYI next_up")
+    }
+
+    fn change_sign(&mut self) {
+        panic!("NYI change_sign")
+    }
+
+    fn from_bits(input: u128) -> Self {
+        panic!("NYI from_bits")
+    }
+
+    fn from_u128(input: u128, round: Round) -> (Self, OpStatus) {
+        panic!("NYI from_u128")
+    }
+
+    fn from_str_rounded(s: &str, round: Round) -> Result<(Self, OpStatus), ParseError> {
+        panic!("NYI from_str_rounded")
+    }
+
+    fn to_bits(self) -> u128 {
+        panic!("NYI to_bits")
+    }
+
+    fn to_u128(self, width: usize, round: Round, is_exact: &mut bool) -> (u128, OpStatus) {
+        panic!("NYI to_u128");
+    }
+
+    fn cmp_abs_normal(self, rhs: Self) -> Ordering {
+        panic!("NYI cmp_abs_normal")
+    }
+
+    fn bitwise_eq(self, rhs: Self) -> bool {
+        panic!("NYI bitwise_eq")
+    }
+
+    fn is_negative(self) -> bool {
+        panic!("NYI is_negative")
+    }
+
+    fn is_denormal(self) -> bool {
+        panic!("NYI is_denormal")
+    }
+
+    fn is_signaling(self) -> bool {
+        panic!("NYI is_signaling")
+    }
+
+    fn category(self) -> Category {
+        panic!("NYI category")
+    }
+
+    fn is_smallest(self) -> bool {
+        panic!("NYI is_smallest")
+    }
+
+    fn is_largest(self) -> bool {
+        panic!("NYI is_largest")
+    }
+
+    fn is_integer(self) -> bool {
+        panic!("NYI is_integer")
+    }
+
+    fn get_exact_inverse(self) -> Option<Self> {
+        panic!("NYI get_exact_inverse")
+    }
+
+    fn ilogb(self) -> i32 {
+        panic!("NYI ilogb")
+    }
+
+    fn scalbn(self, exp: i32, round: Round) -> Self {
+        panic!("NYI scalbn")
+    }
+
+    fn frexp(self, exp: &mut i32, round: Round) -> Self {
+        panic!("NYI frexp")
     }
 }
