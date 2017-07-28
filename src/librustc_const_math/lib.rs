@@ -25,6 +25,8 @@
 #![feature(const_fn)]
 #![feature(i128)]
 #![feature(i128_type)]
+#![feature(slice_patterns)]
+#![feature(try_from)]
 
 extern crate syntax;
 

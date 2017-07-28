@@ -8,12 +8,16 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::cmp::Ordering;
-use std::fmt;
+#![forbid(unsafe_code)]
+
+use std::cmp::{self, Ordering};
+use std::convert::TryFrom;
+use std::fmt::{self, Write};
 use std::i32;
 use std::marker::PhantomData;
+use std::mem;
 use std::ops::{Neg, Add, Sub, Mul, Div, Rem};
-use std::ops::{AddAssign, SubAssign, MulAssign, DivAssign, RemAssign};
+use std::ops::{AddAssign, SubAssign, MulAssign, DivAssign, RemAssign, BitOrAssign};
 use std::str::FromStr;
 
 // Translated from LLVM (C++; FIXME LICENSE) by eddyb, exact sources:
@@ -65,6 +69,12 @@ bitflags! {
         const OVERFLOW = 0x04,
         const UNDERFLOW = 0x08,
         const INEXACT = 0x10
+    }
+}
+
+impl BitOrAssign for OpStatus {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
     }
 }
 
@@ -544,11 +554,33 @@ macro_rules! proxy_impls {
     }
 }
 
+/// Fundamental unit of big integer arithmetic, but also
+/// large to store the largest significands by itself.
+type Limb = u128;
+const LIMB_BITS: usize = 128;
+fn limbs_for_bits(bits: usize) -> usize {
+    (bits + LIMB_BITS - 1) / LIMB_BITS
+}
+
 /// A signed type to represent a floating point number's unbiased exponent.
 type ExpInt = i16;
 
+/// Enum that represents what fraction of the LSB truncated bits of an fp number
+/// represent.
+///
+/// This essentially combines the roles of guard and sticky bits.
+#[must_use]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Loss {
+    // Example of truncated bits:
+    ExactlyZero, // 000000
+    LessThanHalf, // 0xxxxx  x's not all zero
+    ExactlyHalf, // 100000
+    MoreThanHalf, // 1xxxxx  x's not all zero
+}
+
 /// Represents floating point arithmetic semantics.
-pub trait IeeeSemantics: Copy + Clone + Ord + fmt::Debug {
+pub trait IeeeSemantics: Sized + fmt::Debug {
     /// Number of bits in the exponent.
     const EXPONENT_BITS: usize;
 
@@ -562,27 +594,112 @@ pub trait IeeeSemantics: Copy + Clone + Ord + fmt::Debug {
 
     /// Number of bits in the significand. This includes the integer bit.
     const PRECISION: usize;
+
+    /// Total number of bits in the in-memory format.
+    const BITS: usize = Self::EXPONENT_BITS + (Self::PRECISION - 1) + 1;
+
+    /// The significand bit that marks NaN as quiet.
+    const QNAN_BIT: usize = Self::PRECISION - 2;
+
+    /// The significand bitpattern to mark a NaN as quiet.
+    /// NOTE: for X87DoubleExtended we need to set two bits instead of 2.
+    const QNAN_SIGNIFICAND: Limb = 1 << Self::QNAN_BIT;
+
+    fn from_bits(bits: u128) -> Ieee<Self> {
+        let exponent = (bits >> (Self::PRECISION - 1)) & ((1 << Self::EXPONENT_BITS) - 1);
+        let mut r = Ieee {
+            sig: [bits & ((1 << (Self::PRECISION - 1)) - 1)],
+            // Convert the exponent from its bias representation to a signed integer.
+            exp: (exponent as ExpInt) - Self::MAX_EXPONENT,
+            category: Category::Zero,
+            sign: (bits & (1 << (Self::BITS - 1))) != 0,
+            marker: PhantomData,
+        };
+
+        if r.exp == Self::MIN_EXPONENT - 1 && r.sig == [0] {
+            // Exponent, significand meaningless.
+            r.category = Category::Zero;
+        } else if r.exp == Self::MAX_EXPONENT + 1 && r.sig == [0] {
+            // Exponent, significand meaningless.
+            r.category = Category::Infinity;
+        } else if r.exp == Self::MAX_EXPONENT + 1 && r.sig != [0] {
+            // Sign, exponent, significand meaningless.
+            r.category = Category::NaN;
+        } else {
+            r.category = Category::Normal;
+            if r.exp == Self::MIN_EXPONENT - 1 {
+                // Denormal.
+                r.exp = Self::MIN_EXPONENT;
+            } else {
+                // Set integer bit.
+                sig::set_bit(&mut r.sig, Self::PRECISION - 1);
+            }
+        }
+
+        r
+    }
+
+    fn to_bits(x: Ieee<Self>) -> u128 {
+        // Split integer bit from significand.
+        let integer_bit = sig::get_bit(&x.sig, Self::PRECISION - 1);
+        let mut significand = x.sig[0] & ((1 << (Self::PRECISION - 1)) - 1);
+        let exponent = match x.category {
+            Category::Normal => {
+                if x.exp == Self::MIN_EXPONENT && !integer_bit {
+                    // Denormal.
+                    Self::MIN_EXPONENT - 1
+                } else {
+                    x.exp
+                }
+            }
+            Category::Zero => {
+                // FIXME(eddyb) Maybe we should guarantee an invariant instead?
+                significand = 0;
+                Self::MIN_EXPONENT - 1
+            }
+            Category::Infinity => {
+                // FIXME(eddyb) Maybe we should guarantee an invariant instead?
+                significand = 0;
+                Self::MAX_EXPONENT + 1
+            }
+            Category::NaN => Self::MAX_EXPONENT + 1,
+        };
+
+        // Convert the exponent from a signed integer to its bias representation.
+        let exponent = (exponent + Self::MAX_EXPONENT) as u128;
+
+        ((x.sign as u128) << (Self::BITS - 1)) | (exponent << (Self::PRECISION - 1)) | significand
+    }
 }
 
-#[derive(Copy, Clone, PartialOrd, Debug)]
+#[derive(Debug)]
 pub struct Ieee<S: IeeeSemantics> {
+    /// Absolute significand value (including the integer bit).
+    sig: [Limb; 1],
+
+    /// The signed unbiased exponent of the value.
+    exp: ExpInt,
+
+    /// What kind of floating point number this is.
+    category: Category,
+
+    /// Sign bit of the number.
+    sign: bool,
+
     marker: PhantomData<S>,
+}
+
+impl<S: IeeeSemantics> Copy for Ieee<S> {}
+impl<S: IeeeSemantics> Clone for Ieee<S> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 macro_rules! ieee_semantics {
     ($($name:ident { $($items:tt)* })*) => {
-        mod ieee_semantics {
-            use super::{ExpInt, IeeeSemantics};
-
-            $(
-                // FIXME(eddyb) Remove most of these by manual impls
-                // on the structs parameterized by S: IeeeSemantics.
-                #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-                pub struct $name;
-                impl IeeeSemantics for $name { $($items)* }
-            )*
-        }
-
+        mod ieee_semantics { $(#[derive(Debug)] pub struct $name;)* }
+        $(impl IeeeSemantics for ieee_semantics::$name { $($items)* })*
         $(pub type $name = Ieee<ieee_semantics::$name>;)*
     }
 }
@@ -592,39 +709,120 @@ ieee_semantics! {
     IeeeSingle { const EXPONENT_BITS: usize = 8; const PRECISION: usize = 24; }
     IeeeDouble { const EXPONENT_BITS: usize = 11; const PRECISION: usize = 53; }
     IeeeQuad { const EXPONENT_BITS: usize = 15; const PRECISION: usize = 113; }
-    X87DoubleExtended { const EXPONENT_BITS: usize = 15; const PRECISION: usize = 64; }
+    X87DoubleExtended {
+        const EXPONENT_BITS: usize = 15;
+        const PRECISION: usize = 64;
+        const BITS: usize = 80;
 
-    // These are legacy semantics for the fallback, inaccrurate implementation of
-    // IBM double-double, if the accurate PpcDoubleDouble doesn't handle the
-    // operation. It's equivalent to having an IEEE number with consecutive 106
-    // bits of mantissa and 11 bits of exponent.
-    //
-    // It's not equivalent to IBM double-double. For example, a legit IBM
-    // double-double, 1 + epsilon:
-    //
-    //   1 + epsilon = 1 + (1 >> 1076)
-    //
-    // is not representable by a consecutive 106 bits of mantissa.
-    //
-    // Currently, these semantics are used in the following way:
-    //
-    //   PpcDoubleDouble -> (IeeeDouble, IeeeDouble) ->
-    //   (64 bits, 64 bits) -> (128 bits) ->
-    //   PpcDoubleDoubleLegacy -> IEEE operations
-    //
-    // We use to_bits() to get the bit representation of the
-    // underlying IeeeDouble, then construct the legacy IEEE float.
-    //
-    // FIXME: Implement all operations in PpcDoubleDouble, and delete these
-    // semantics.
-    PpcDoubleDoubleLegacy {
-        const EXPONENT_BITS: usize = 11;
-        const MIN_EXPONENT: ExpInt = -1022 + 53;
-        const PRECISION: usize = 53 + 53;
+        /// For x87 extended precision, we want to make a NaN, not a
+        /// pseudo-NaN. Maybe we should expose the ability to make
+        /// pseudo-NaNs?
+        const QNAN_SIGNIFICAND: Limb = 0b11 << Self::QNAN_BIT;
+
+        /// Integer bit is explicit in this format. Intel hardware (387 and later)
+        /// does not support these bit patterns:
+        ///  exponent = all 1's, integer bit 0, significand 0 ("pseudoinfinity")
+        ///  exponent = all 1's, integer bit 0, significand nonzero ("pseudoNaN")
+        ///  exponent = 0, integer bit 1 ("pseudodenormal")
+        ///  exponent!=0 nor all 1's, integer bit 0 ("unnormal")
+        /// At the moment, the first two are treated as NaNs, the second two as Normal.
+        fn from_bits(bits: u128) -> Ieee<Self> {
+            let exponent = (bits >> Self::PRECISION) & ((1 << Self::EXPONENT_BITS) - 1);
+            let mut r = Ieee {
+                sig: [bits & ((1 << (Self::PRECISION - 1)) - 1)],
+                // Convert the exponent from its bias representation to a signed integer.
+                exp: (exponent as ExpInt) - Self::MAX_EXPONENT,
+                category: Category::Zero,
+                sign: (bits & (1 << (Self::BITS - 1))) != 0,
+                marker: PhantomData
+            };
+
+            if r.exp == Self::MIN_EXPONENT - 1 && r.sig == [0] {
+                // Exponent, significand meaningless.
+                r.category = Category::Zero;
+            } else if r.exp == Self::MAX_EXPONENT + 1
+                && r.sig == [1 << (Self::PRECISION - 1)] {
+                // Exponent, significand meaningless.
+                r.category = Category::Infinity;
+            } else if r.exp == Self::MAX_EXPONENT + 1
+                && r.sig != [1 << (Self::PRECISION - 1)] {
+                // Sign, exponent, significand meaningless.
+                r.category = Category::NaN;
+            } else {
+                r.category = Category::Normal;
+                if r.exp == Self::MIN_EXPONENT - 1 {
+                    // Denormal.
+                    r.exp = Self::MIN_EXPONENT;
+                }
+            }
+
+            r
+        }
+
+        fn to_bits(x: Ieee<Self>) -> u128 {
+            // Get integer bit from significand.
+            let integer_bit = sig::get_bit(&x.sig, Self::PRECISION - 1);
+            let mut significand = x.sig[0] & ((1 << Self::PRECISION) - 1);
+            let exponent = match x.category {
+                Category::Normal => {
+                    if x.exp == Self::MIN_EXPONENT && !integer_bit {
+                        // Denormal.
+                        Self::MIN_EXPONENT - 1
+                    } else {
+                        x.exp
+                    }
+                }
+                Category::Zero => {
+                    // FIXME(eddyb) Maybe we should guarantee an invariant instead?
+                    significand = 0;
+                    Self::MIN_EXPONENT - 1
+                }
+                Category::Infinity => {
+                    // FIXME(eddyb) Maybe we should guarantee an invariant instead?
+                    significand = 1 << (Self::PRECISION - 1);
+                    Self::MAX_EXPONENT + 1
+                }
+                Category::NaN => Self::MAX_EXPONENT + 1
+            };
+
+            // Convert the exponent from a signed integer to its bias representation.
+            let exponent = (exponent + Self::MAX_EXPONENT) as u128;
+
+            ((x.sign as u128) << (Self::BITS - 1)) | (exponent << Self::PRECISION) | significand
+        }
     }
 }
 
 proxy_impls!([S: IeeeSemantics] Ieee<S>);
+
+impl<S: IeeeSemantics> PartialOrd for Ieee<S> {
+    fn partial_cmp(&self, rhs: &Self) -> Option<Ordering> {
+        match (self.category, rhs.category) {
+            (Category::NaN, _) |
+            (_, Category::NaN) => None,
+
+            (Category::Infinity, Category::Infinity) => Some((!self.sign).cmp(&(!rhs.sign))),
+
+            (Category::Zero, Category::Zero) => Some(Ordering::Equal),
+
+            (Category::Infinity, _) |
+            (Category::Normal, Category::Zero) => Some((!self.sign).cmp(&self.sign)),
+
+            (_, Category::Infinity) |
+            (Category::Zero, Category::Normal) => Some(rhs.sign.cmp(&(!rhs.sign))),
+
+            (Category::Normal, Category::Normal) => {
+                // Two normal numbers. Do they have the same sign?
+                Some((!self.sign).cmp(&(!rhs.sign)).then_with(|| {
+                    // Compare absolute values; invert result if negative.
+                    let result = self.cmp_abs_normal(*rhs);
+
+                    if self.sign { result.reverse() } else { result }
+                }))
+            }
+        }
+    }
+}
 
 /// Prints this value as a decimal string.
 ///
@@ -652,157 +850,1907 @@ proxy_impls!([S: IeeeSemantics] Ieee<S>);
 /// 1.01E-2              5        2       0.0101
 /// 1.01E-2              4        2       0.0101
 /// 1.01E-2              4        1       1.01E-2
-#[allow(unused)]
 impl<S: IeeeSemantics> fmt::Display for Ieee<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let frac_digits = f.precision().unwrap_or(0);
         let width = f.width().unwrap_or(3);
         let alternate = f.alternate();
-        panic!("NYI Display::fmt");
+
+        match self.category {
+            Category::Infinity => {
+                if self.sign {
+                    return f.write_str("-Inf");
+                } else {
+                    return f.write_str("+Inf");
+                }
+            }
+
+            Category::NaN => return f.write_str("NaN"),
+
+            Category::Zero => {
+                if self.sign {
+                    f.write_char('-')?;
+                }
+
+                if width == 0 {
+                    if alternate {
+                        f.write_str("0.0")?;
+                        if let Some(n) = f.precision() {
+                            for _ in 1..n {
+                                f.write_char('0')?;
+                            }
+                        }
+                        f.write_str("e+00")?;
+                    } else {
+                        f.write_str("0.0E+0")?;
+                    }
+                } else {
+                    f.write_char('0')?;
+                }
+                return Ok(());
+            }
+
+            Category::Normal => {}
+        }
+
+        if self.sign {
+            f.write_char('-')?;
+        }
+
+        // We use enough digits so the number can be round-tripped back to an
+        // APFloat. The formula comes from "How to Print Floating-Point Numbers
+        // Accurately" by Steele and White.
+        // FIXME: Using a formula based purely on the precision is conservative;
+        // we can print fewer digits depending on the actual value being printed.
+
+        // precision = 2 + floor(S::PRECISION / lg_2(10))
+        let precision = f.precision().unwrap_or(2 + S::PRECISION * 59 / 196);
+
+        // Decompose the number into an APInt and an exponent.
+        let mut exp = self.exp - (S::PRECISION as ExpInt - 1);
+        let mut sig = vec![self.sig[0]];
+
+        // Ignore trailing binary zeros.
+        let trailing_zeros = sig[0].trailing_zeros();
+        let _: Loss = sig::shift_right(&mut sig, &mut exp, trailing_zeros as usize);
+
+        // Change the exponent from 2^e to 10^e.
+        if exp == 0 {
+            // Nothing to do.
+        } else if exp > 0 {
+            // Just shift left.
+            let shift = exp as usize;
+            sig.resize(limbs_for_bits(S::PRECISION + shift), 0);
+            sig::shift_left(&mut sig, &mut exp, shift);
+        } else {
+            // exp < 0
+            let mut texp = -exp as usize;
+
+            // We transform this using the identity:
+            //   (N)(2^-e) == (N)(5^e)(10^-e)
+
+            // Multiply significand by 5^e.
+            //   N * 5^0101 == N * 5^(1*1) * 5^(0*2) * 5^(1*4) * 5^(0*8)
+            let mut sig_scratch = vec![];
+            let mut p5 = vec![];
+            let mut p5_scratch = vec![];
+            while texp != 0 {
+                if p5.is_empty() {
+                    p5.push(5);
+                } else {
+                    p5_scratch.resize(p5.len() * 2, 0);
+                    let _: Loss =
+                        sig::mul(&mut p5_scratch, &mut 0, &p5, &p5, p5.len() * 2 * LIMB_BITS);
+                    while p5_scratch.last() == Some(&0) {
+                        p5_scratch.pop();
+                    }
+                    mem::swap(&mut p5, &mut p5_scratch);
+                }
+                if texp & 1 != 0 {
+                    sig_scratch.resize(sig.len() + p5.len(), 0);
+                    let _: Loss = sig::mul(
+                        &mut sig_scratch,
+                        &mut 0,
+                        &sig,
+                        &p5,
+                        (sig.len() + p5.len()) * LIMB_BITS,
+                    );
+                    while sig_scratch.last() == Some(&0) {
+                        sig_scratch.pop();
+                    }
+                    mem::swap(&mut sig, &mut sig_scratch);
+                }
+                texp >>= 1;
+            }
+        }
+
+        // Fill the buffer.
+        let mut buffer = vec![];
+
+        // Ignore digits from the significand until it is no more
+        // precise than is required for the desired precision.
+        // 196/59 is a very slight overestimate of lg_2(10).
+        let required = (precision * 196 + 58) / 59;
+        let mut discard_digits = sig::omsb(&sig).saturating_sub(required) * 59 / 196;
+        let mut in_trail = true;
+        while !sig.is_empty() {
+            // Perform short division by 10 to extract the rightmost digit.
+            // rem <- sig % 10
+            // sig <- sig / 10
+            let mut rem = 0;
+            for limb in sig.iter_mut().rev() {
+                // We don't have an integer doubly wide than Limb,
+                // so we have to split the divrem on two halves.
+                const HALF_BITS: usize = LIMB_BITS / 2;
+                let mut halves = [*limb & ((1 << HALF_BITS) - 1), *limb >> HALF_BITS];
+                for half in halves.iter_mut().rev() {
+                    *half |= rem << HALF_BITS;
+                    rem = *half % 10;
+                    *half /= 10;
+                }
+                *limb = halves[0] | (halves[1] << HALF_BITS);
+            }
+            // Reduce the sigificand to avoid wasting time dividing 0's.
+            while sig.last() == Some(&0) {
+                sig.pop();
+            }
+
+            let digit = rem;
+
+            // Ignore digits we don't need.
+            if discard_digits > 0 {
+                discard_digits -= 1;
+                exp += 1;
+                continue;
+            }
+
+            // Drop trailing zeros.
+            if in_trail && digit == 0 {
+                exp += 1;
+            } else {
+                in_trail = false;
+                buffer.push(b'0' + digit as u8);
+            }
+        }
+
+        assert!(!buffer.is_empty(), "no characters in buffer!");
+
+        // Drop down to precision.
+        // FIXME: don't do more precise calculations above than are required.
+        if buffer.len() > precision {
+            // The most significant figures are the last ones in the buffer.
+            let mut first_sig = buffer.len() - precision;
+
+            // Round.
+            // FIXME: this probably shouldn't use 'round half up'.
+
+            // Rounding down is just a truncation, except we also want to drop
+            // trailing zeros from the new result.
+            if buffer[first_sig - 1] < b'5' {
+                while first_sig < buffer.len() && buffer[first_sig] == b'0' {
+                    first_sig += 1;
+                }
+            } else {
+                // Rounding up requires a decimal add-with-carry. If we continue
+                // the carry, the newly-introduced zeros will just be truncated.
+                for x in &mut buffer[first_sig..] {
+                    if *x == b'9' {
+                        first_sig += 1;
+                    } else {
+                        *x += 1;
+                        break;
+                    }
+                }
+            }
+
+            exp += first_sig as ExpInt;
+            buffer.drain(..first_sig);
+
+            // If we carried through, we have exactly one digit of precision.
+            if buffer.is_empty() {
+                buffer.push(b'1');
+            }
+        }
+
+        let digits = buffer.len();
+
+        // Check whether we should use scientific notation.
+        let scientific = if width == 0 {
+            true
+        } else {
+            if exp >= 0 {
+                // 765e3 --> 765000
+                //              ^^^
+                // But we shouldn't make the number look more precise than it is.
+                exp as usize > width || digits + exp as usize > precision
+            } else {
+                // Power of the most significant digit.
+                let msd = exp + (digits - 1) as ExpInt;
+                if msd >= 0 {
+                    // 765e-2 == 7.65
+                    false
+                } else {
+                    // 765e-5 == 0.00765
+                    //           ^ ^^
+                    -msd as usize > width
+                }
+            }
+        };
+
+        // Scientific formatting is pretty straightforward.
+        if scientific {
+            exp += digits as ExpInt - 1;
+
+            f.write_char(buffer[digits - 1] as char)?;
+            f.write_char('.')?;
+            let truncate_zero = !alternate;
+            if digits == 1 && truncate_zero {
+                f.write_char('0')?;
+            } else {
+                for &d in buffer[..digits - 1].iter().rev() {
+                    f.write_char(d as char)?;
+                }
+            }
+            // Fill with zeros up to precision.
+            if !truncate_zero && precision > digits - 1 {
+                for _ in 0..precision - digits + 1 {
+                    f.write_char('0')?;
+                }
+            }
+            // For alternate we use lower 'e'.
+            f.write_char(if alternate { 'e' } else { 'E' })?;
+
+            // Exponent always at least two digits if we do not truncate zeros.
+            if truncate_zero {
+                write!(f, "{:+}", exp)?;
+            } else {
+                write!(f, "{:+03}", exp)?;
+            }
+
+            return Ok(());
+        }
+
+        // Non-scientific, positive exponents.
+        if exp >= 0 {
+            for &d in buffer.iter().rev() {
+                f.write_char(d as char)?;
+            }
+            for _ in 0..exp {
+                f.write_char('0')?;
+            }
+            return Ok(());
+        }
+
+        // Non-scientific, negative exponents.
+        let unit_place = -exp as usize;
+        if unit_place < digits {
+            for &d in buffer[unit_place..].iter().rev() {
+                f.write_char(d as char)?;
+            }
+            f.write_char('.')?;
+            for &d in buffer[..unit_place].iter().rev() {
+                f.write_char(d as char)?;
+            }
+        } else {
+            f.write_str("0.")?;
+            for _ in digits..unit_place {
+                f.write_char('0')?;
+            }
+            for &d in buffer.iter().rev() {
+                f.write_char(d as char)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
-#[allow(unused)]
 impl<S: IeeeSemantics> Float for Ieee<S> {
     fn zero() -> Self {
-        panic!("NYI zero")
+        Ieee {
+            sig: [0],
+            exp: S::MIN_EXPONENT - 1,
+            category: Category::Zero,
+            sign: false,
+            marker: PhantomData,
+        }
     }
 
     fn inf() -> Self {
-        panic!("NYI inf")
+        Ieee {
+            sig: [0],
+            exp: S::MAX_EXPONENT + 1,
+            category: Category::Infinity,
+            sign: false,
+            marker: PhantomData,
+        }
     }
 
     fn qnan(payload: Option<u128>) -> Self {
-        panic!("NYI qnan")
+        Ieee {
+            sig: [
+                S::QNAN_SIGNIFICAND |
+                    payload.map_or(0, |payload| {
+                        // Zero out the excess bits of the significand.
+                        payload & ((1 << S::QNAN_BIT) - 1)
+                    }),
+            ],
+            exp: S::MAX_EXPONENT + 1,
+            category: Category::NaN,
+            sign: false,
+            marker: PhantomData,
+        }
     }
 
     fn snan(payload: Option<u128>) -> Self {
-        panic!("NYI snan")
+        let mut snan = Self::qnan(payload);
+
+        // We always have to clear the QNaN bit to make it an SNaN.
+        sig::clear_bit(&mut snan.sig, S::QNAN_BIT);
+
+        // If there are no bits set in the payload, we have to set
+        // *something* to make it a NaN instead of an infinity;
+        // conventionally, this is the next bit down from the QNaN bit.
+        if snan.sig[0] & !S::QNAN_SIGNIFICAND == 0 {
+            sig::set_bit(&mut snan.sig, S::QNAN_BIT - 1);
+        }
+
+        snan
     }
 
     fn largest() -> Self {
-        panic!("NYI largest")
+        // We want (in interchange format):
+        //   exponent = 1..10
+        //   significand = 1..1
+        Ieee {
+            sig: [!0 & ((1 << S::PRECISION) - 1)],
+            exp: S::MAX_EXPONENT,
+            category: Category::Normal,
+            sign: false,
+            marker: PhantomData,
+        }
     }
 
     fn smallest() -> Self {
-        panic!("NYI smallest")
+        // We want (in interchange format):
+        //   exponent = 0..0
+        //   significand = 0..01
+        Ieee {
+            sig: [1],
+            exp: S::MIN_EXPONENT,
+            category: Category::Normal,
+            sign: false,
+            marker: PhantomData,
+        }
     }
 
     fn smallest_normalized() -> Self {
-        panic!("NYI smallest_normalized")
+        // We want (in interchange format):
+        //   exponent = 0..0
+        //   significand = 10..0
+        Ieee {
+            sig: [1 << (S::PRECISION - 1)],
+            exp: S::MIN_EXPONENT,
+            category: Category::Normal,
+            sign: false,
+            marker: PhantomData,
+        }
     }
 
     fn add_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
-        panic!("NYI add_rounded")
+        let fs = match (self.category, rhs.category) {
+            (Category::Infinity, Category::Infinity) => {
+                // Differently signed infinities can only be validly
+                // subtracted.
+                if self.sign != rhs.sign {
+                    *self = Self::nan();
+                    OpStatus::INVALID_OP
+                } else {
+                    OpStatus::OK
+                }
+            }
+
+            // Sign may depend on rounding mode; handled below.
+            (_, Category::Zero) |
+            (Category::NaN, _) |
+            (Category::Infinity, Category::Normal) => OpStatus::OK,
+
+            (Category::Zero, _) |
+            (_, Category::NaN) |
+            (_, Category::Infinity) => {
+                *self = rhs;
+                OpStatus::OK
+            }
+
+            // This return code means it was not a simple case.
+            (Category::Normal, Category::Normal) => {
+                let loss = sig::add_or_sub(
+                    &mut self.sig,
+                    &mut self.exp,
+                    &mut self.sign,
+                    &mut [rhs.sig[0]],
+                    rhs.exp,
+                    rhs.sign,
+                );
+                let fs = self.normalize(round, loss);
+
+                // Can only be zero if we lost no fraction.
+                assert!(self.category != Category::Zero || loss == Loss::ExactlyZero);
+
+                fs
+            }
+        };
+
+        // If two numbers add (exactly) to zero, IEEE 754 decrees it is a
+        // positive zero unless rounding to minus infinity, except that
+        // adding two like-signed zeroes gives that zero.
+        if self.category == Category::Zero &&
+            (rhs.category != Category::Zero || self.sign != rhs.sign)
+        {
+            self.sign = round == Round::TowardNegative;
+        }
+
+        fs
     }
 
     fn mul_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
-        panic!("NYI mul_rounded")
+        self.sign ^= rhs.sign;
+
+        match (self.category, rhs.category) {
+            (Category::NaN, _) => {
+                self.sign = false;
+                OpStatus::OK
+            }
+
+            (_, Category::NaN) => {
+                self.sign = false;
+                self.category = Category::NaN;
+                self.sig = rhs.sig;
+                OpStatus::OK
+            }
+
+            (Category::Zero, Category::Infinity) |
+            (Category::Infinity, Category::Zero) => {
+                *self = Self::nan();
+                OpStatus::INVALID_OP
+            }
+
+            (_, Category::Infinity) |
+            (Category::Infinity, _) => {
+                self.category = Category::Infinity;
+                OpStatus::OK
+            }
+
+            (Category::Zero, _) |
+            (_, Category::Zero) => {
+                self.category = Category::Zero;
+                OpStatus::OK
+            }
+
+            (Category::Normal, Category::Normal) => {
+                self.exp += rhs.exp;
+                let mut wide_sig = [0; 2];
+                let loss = sig::mul(
+                    &mut wide_sig,
+                    &mut self.exp,
+                    &self.sig,
+                    &rhs.sig,
+                    S::PRECISION,
+                );
+                self.sig = [wide_sig[0]];
+                let mut fs = self.normalize(round, loss);
+                if loss != Loss::ExactlyZero {
+                    fs |= OpStatus::INEXACT;
+                }
+                fs
+            }
+        }
     }
 
     fn div_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
-        panic!("NYI div_rounded")
+        self.sign ^= rhs.sign;
+
+        match (self.category, rhs.category) {
+            (Category::NaN, _) => {
+                self.sign = false;
+                OpStatus::OK
+            }
+
+            (_, Category::NaN) => {
+                self.category = Category::NaN;
+                self.sig = rhs.sig;
+                self.sign = false;
+                OpStatus::OK
+            }
+
+            (Category::Infinity, Category::Infinity) |
+            (Category::Zero, Category::Zero) => {
+                *self = Self::nan();
+                OpStatus::INVALID_OP
+            }
+
+            (Category::Infinity, _) |
+            (Category::Zero, _) => OpStatus::OK,
+
+            (Category::Normal, Category::Infinity) => {
+                self.category = Category::Zero;
+                OpStatus::OK
+            }
+
+            (Category::Normal, Category::Zero) => {
+                self.category = Category::Infinity;
+                OpStatus::DIV_BY_ZERO
+            }
+
+            (Category::Normal, Category::Normal) => {
+                self.exp -= rhs.exp;
+                let dividend = self.sig[0];
+                let loss = sig::div(
+                    &mut self.sig,
+                    &mut self.exp,
+                    &mut [dividend],
+                    &mut [rhs.sig[0]],
+                    S::PRECISION,
+                );
+                let mut fs = self.normalize(round, loss);
+                if loss != Loss::ExactlyZero {
+                    fs |= OpStatus::INEXACT;
+                }
+                fs
+            }
+        }
     }
 
+    // This is not currently correct in all cases.
     fn remainder(&mut self, rhs: Self) -> OpStatus {
-        panic!("NYI remainder")
+        let mut v = *self;
+        let orig_sign = self.sign;
+
+        let fs = v.div_rounded(rhs, Round::NearestTiesToEven);
+        if fs == OpStatus::DIV_BY_ZERO {
+            return fs;
+        }
+
+        assert!(S::PRECISION < LIMB_BITS);
+        assert!(LIMB_BITS <= 128);
+
+        let (x, fs) = v.to_i128(LIMB_BITS, Round::NearestTiesToEven, &mut false);
+        if fs == OpStatus::INVALID_OP {
+            return fs;
+        }
+
+        let (mut v, fs) = Self::from_i128(x, Round::NearestTiesToEven);
+        assert_eq!(fs, OpStatus::OK); // should always work
+
+        let fs = v.mul_rounded(rhs, Round::NearestTiesToEven);
+        assert!(fs == OpStatus::OK || fs == OpStatus::INEXACT); // should not overflow or underflow
+
+        let fs = self.sub_rounded(v, Round::NearestTiesToEven);
+        assert!(fs == OpStatus::OK || fs == OpStatus::INEXACT); // likewise
+
+        if self.is_zero() {
+            self.sign = orig_sign; // IEEE754 requires this
+        }
+        fs
     }
 
     fn modulo(&mut self, rhs: Self) -> OpStatus {
-        panic!("NYI modulo")
+        match (self.category, rhs.category) {
+            (Category::NaN, _) |
+            (Category::Zero, Category::Infinity) |
+            (Category::Zero, Category::Normal) |
+            (Category::Normal, Category::Infinity) => OpStatus::OK,
+
+            (_, Category::NaN) => {
+                self.sign = false;
+                self.category = Category::NaN;
+                self.sig = rhs.sig;
+                OpStatus::OK
+            }
+
+            (Category::Infinity, _) |
+            (_, Category::Zero) => {
+                *self = Self::nan();
+                OpStatus::INVALID_OP
+            }
+
+            (Category::Normal, Category::Normal) => {
+                while self.is_finite_non_zero() && rhs.is_finite_non_zero() &&
+                    self.cmp_abs_normal(rhs) != Ordering::Less
+                {
+                    let mut v = rhs.scalbn(self.ilogb() - rhs.ilogb(), Round::NearestTiesToEven);
+                    if self.cmp_abs_normal(v) == Ordering::Less {
+                        v = v.scalbn(-1, Round::NearestTiesToEven);
+                    }
+                    v.sign = self.sign;
+
+                    assert_eq!(self.sub_rounded(v, Round::NearestTiesToEven), OpStatus::OK);
+                }
+                OpStatus::OK
+            }
+        }
     }
 
     fn fused_mul_add(&mut self, multiplicand: Self, addend: Self, round: Round) -> OpStatus {
-        panic!("NYI fused_mul_add")
+        // If and only if all arguments are normal do we need to do an
+        // extended-precision calculation.
+        if !self.is_finite_non_zero() || !multiplicand.is_finite_non_zero() || !addend.is_finite() {
+            let mut fs = self.mul_rounded(multiplicand, round);
+
+            // FS can only be OpStatus::OK or OpStatus::INVALID_OP. There is no more work
+            // to do in the latter case. The IEEE-754R standard says it is
+            // implementation-defined in this case whether, if ADDEND is a
+            // quiet NaN, we raise invalid op; this implementation does so.
+            //
+            // If we need to do the addition we can do so with normal
+            // precision.
+            if fs == OpStatus::OK {
+                fs = self.add_rounded(addend, round);
+            }
+            return fs;
+        }
+
+        // Post-multiplication sign, before addition.
+        self.sign ^= multiplicand.sign;
+
+        // Allocate space for twice as many bits as the original significand, plus one
+        // extra bit for the addition to overflow into.
+        assert!(limbs_for_bits(S::PRECISION * 2 + 1) <= 2);
+        let mut wide_sig = sig::widening_mul(self.sig[0], multiplicand.sig[0]);
+
+        let mut loss = Loss::ExactlyZero;
+        let mut omsb = sig::omsb(&wide_sig);
+        self.exp += multiplicand.exp;
+
+        // Assume the operands involved in the multiplication are single-precision
+        // FP, and the two multiplicants are:
+        //     lhs = a23 . a22 ... a0 * 2^e1
+        //     rhs = b23 . b22 ... b0 * 2^e2
+        // the result of multiplication is:
+        //     lhs = c48 c47 c46 . c45 ... c0 * 2^(e1+e2)
+        // Note that there are three significant bits at the left-hand side of the
+        // radix point: two for the multiplication, and an overflow bit for the
+        // addition (that will always be zero at this point). Move the radix point
+        // toward left by two bits, and adjust exponent accordingly.
+        self.exp += 2;
+
+        if addend.is_non_zero() {
+            // Normalize our MSB to one below the top bit to allow for overflow.
+            let ext_precision = 2 * S::PRECISION + 1;
+            if omsb != ext_precision - 1 {
+                assert!(ext_precision > omsb);
+                sig::shift_left(&mut wide_sig, &mut self.exp, (ext_precision - 1) - omsb);
+            }
+
+            // The intermediate result of the multiplication has "2 * S::PRECISION"
+            // signicant bit; adjust the addend to be consistent with mul result.
+            let mut ext_addend_sig = [addend.sig[0], 0];
+
+            // Extend the addend significand to ext_precision - 1. This guarantees
+            // that the high bit of the significand is zero (same as wide_sig),
+            // so the addition will overflow (if it does overflow at all) into the top bit.
+            sig::shift_left(
+                &mut ext_addend_sig,
+                &mut 0,
+                ext_precision - 1 - S::PRECISION,
+            );
+            loss = sig::add_or_sub(
+                &mut wide_sig,
+                &mut self.exp,
+                &mut self.sign,
+                &mut ext_addend_sig,
+                addend.exp + 1,
+                addend.sign,
+            );
+
+            omsb = sig::omsb(&wide_sig);
+        }
+
+        // Convert the result having "2 * S::PRECISION" significant-bits back to the one
+        // having "S::PRECISION" significant-bits. First, move the radix point from
+        // poision "2*S::PRECISION - 1" to "S::PRECISION - 1". The exponent need to be
+        // adjusted by "2*S::PRECISION - 1" - "S::PRECISION - 1" = "S::PRECISION".
+        self.exp -= S::PRECISION as ExpInt + 1;
+
+        // In case MSB resides at the left-hand side of radix point, shift the
+        // mantissa right by some amount to make sure the MSB reside right before
+        // the radix point (i.e. "MSB . rest-significant-bits").
+        if omsb > S::PRECISION {
+            let bits = omsb - S::PRECISION;
+            loss = sig::shift_right(&mut wide_sig, &mut self.exp, bits).combine(loss);
+        }
+
+        self.sig[0] = wide_sig[0];
+
+        let mut fs = self.normalize(round, loss);
+        if loss != Loss::ExactlyZero {
+            fs |= OpStatus::INEXACT;
+        }
+
+        // If two numbers add (exactly) to zero, IEEE 754 decrees it is a
+        // positive zero unless rounding to minus infinity, except that
+        // adding two like-signed zeroes gives that zero.
+        if self.category == Category::Zero && !fs.intersects(OpStatus::UNDERFLOW) &&
+            self.sign != addend.sign
+        {
+            self.sign = round == Round::TowardNegative;
+        }
+
+        fs
     }
 
     fn round_to_integral(self, round: Round) -> (Self, OpStatus) {
-        panic!("NYI round_to_integral")
+        // If the exponent is large enough, we know that this value is already
+        // integral, and the arithmetic below would potentially cause it to saturate
+        // to +/-Inf. Bail out early instead.
+        if self.is_finite_non_zero() && self.exp + 1 >= S::PRECISION as ExpInt {
+            return (self, OpStatus::OK);
+        }
+
+        // The algorithm here is quite simple: we add 2^(p-1), where p is the
+        // precision of our format, and then subtract it back off again. The choice
+        // of rounding modes for the addition/subtraction determines the rounding mode
+        // for our integral rounding as well.
+        // NOTE: When the input value is negative, we do subtraction followed by
+        // addition instead.
+        assert!(S::PRECISION <= 128);
+        let (mut magic_const, fs) =
+            Self::from_u128(1 << (S::PRECISION - 1), Round::NearestTiesToEven);
+        magic_const.sign = self.sign;
+
+        if fs != OpStatus::OK {
+            return (self, fs);
+        }
+
+        let mut r = self;
+        let fs = r.add_rounded(magic_const, round);
+        if fs != OpStatus::OK && fs != OpStatus::INEXACT {
+            return (self, fs);
+        }
+
+        let fs = r.sub_rounded(magic_const, round);
+
+        // Restore the input sign to handle 0.0/-0.0 cases correctly.
+        r.sign = self.sign;
+
+        (r, fs)
     }
 
     fn next_up(&mut self) -> OpStatus {
-        panic!("NYI next_up")
+        // Compute nextUp(x), handling each float category separately.
+        match self.category {
+            Category::Infinity => {
+                if self.sign {
+                    // nextUp(-inf) = -largest
+                    *self = -Self::largest();
+                    OpStatus::OK
+                } else {
+                    // nextUp(+inf) = +inf
+                    OpStatus::OK
+                }
+            }
+            Category::NaN => {
+                // IEEE-754R 2008 6.2 Par 2: nextUp(sNaN) = qNaN. Set Invalid flag.
+                // IEEE-754R 2008 6.2: nextUp(qNaN) = qNaN. Must be identity so we do not
+                //                     change the payload.
+                if self.is_signaling() {
+                    // For consistency, propagate the sign of the sNaN to the qNaN.
+                    *self = Self::nan().copy_sign(*self);
+                    OpStatus::INVALID_OP
+                } else {
+                    OpStatus::OK
+                }
+            }
+            Category::Zero => {
+                // nextUp(pm 0) = +smallest
+                *self = Self::smallest();
+                OpStatus::OK
+            }
+            Category::Normal => {
+                // nextUp(-smallest) = -0
+                if self.is_smallest() && self.sign {
+                    *self = -Self::zero();
+                    return OpStatus::OK;
+                }
+
+                // nextUp(largest) == INFINITY
+                if self.is_largest() && !self.sign {
+                    *self = Self::inf();
+                    return OpStatus::OK;
+                }
+
+                // Excluding the integral bit. This allows us to test for binade boundaries.
+                let sig_mask = (1 << (S::PRECISION - 1)) - 1;
+
+                // nextUp(normal) == normal + inc.
+                if self.sign {
+                    // If we are negative, we need to decrement the significand.
+
+                    // We only cross a binade boundary that requires adjusting the exponent
+                    // if:
+                    //   1. exponent != S::MIN_EXPONENT. This implies we are not in the
+                    //   smallest binade or are dealing with denormals.
+                    //   2. Our significand excluding the integral bit is all zeros.
+                    let crossing_binade_boundary = self.exp != S::MIN_EXPONENT &&
+                        self.sig[0] & sig_mask == 0;
+
+                    // Decrement the significand.
+                    //
+                    // We always do this since:
+                    //   1. If we are dealing with a non-binade decrement, by definition we
+                    //   just decrement the significand.
+                    //   2. If we are dealing with a normal -> normal binade decrement, since
+                    //   we have an explicit integral bit the fact that all bits but the
+                    //   integral bit are zero implies that subtracting one will yield a
+                    //   significand with 0 integral bit and 1 in all other spots. Thus we
+                    //   must just adjust the exponent and set the integral bit to 1.
+                    //   3. If we are dealing with a normal -> denormal binade decrement,
+                    //   since we set the integral bit to 0 when we represent denormals, we
+                    //   just decrement the significand.
+                    sig::decrement(&mut self.sig);
+
+                    if crossing_binade_boundary {
+                        // Our result is a normal number. Do the following:
+                        // 1. Set the integral bit to 1.
+                        // 2. Decrement the exponent.
+                        sig::set_bit(&mut self.sig, S::PRECISION - 1);
+                        self.exp -= 1;
+                    }
+                } else {
+                    // If we are positive, we need to increment the significand.
+
+                    // We only cross a binade boundary that requires adjusting the exponent if
+                    // the input is not a denormal and all of said input's significand bits
+                    // are set. If all of said conditions are true: clear the significand, set
+                    // the integral bit to 1, and increment the exponent. If we have a
+                    // denormal always increment since moving denormals and the numbers in the
+                    // smallest normal binade have the same exponent in our representation.
+                    let crossing_binade_boundary = !self.is_denormal() &&
+                        self.sig[0] & sig_mask == sig_mask;
+
+                    if crossing_binade_boundary {
+                        self.sig = [0];
+                        sig::set_bit(&mut self.sig, S::PRECISION - 1);
+                        assert_ne!(
+                            self.exp,
+                            S::MAX_EXPONENT,
+                            "We can not increment an exponent beyond the MAX_EXPONENT \
+                             allowed by the given floating point semantics."
+                        );
+                        self.exp += 1;
+                    } else {
+                        sig::increment(&mut self.sig);
+                    }
+                }
+                OpStatus::OK
+            }
+        }
     }
 
     fn change_sign(&mut self) {
-        panic!("NYI change_sign")
+        self.sign = !self.sign;
     }
 
     fn from_bits(input: u128) -> Self {
-        panic!("NYI from_bits")
+        // Dispatch to semantics.
+        S::from_bits(input)
     }
 
     fn from_u128(input: u128, round: Round) -> (Self, OpStatus) {
-        panic!("NYI from_u128")
+        let mut r = Ieee {
+            sig: [input],
+            exp: S::PRECISION as ExpInt - 1,
+            category: Category::Normal,
+            sign: false,
+            marker: PhantomData,
+        };
+        let fs = r.normalize(round, Loss::ExactlyZero);
+        (r, fs)
     }
 
-    fn from_str_rounded(s: &str, round: Round) -> Result<(Self, OpStatus), ParseError> {
-        panic!("NYI from_str_rounded")
+    fn from_str_rounded(mut s: &str, mut round: Round) -> Result<(Self, OpStatus), ParseError> {
+        if s.is_empty() {
+            return Err(ParseError("Invalid string length"));
+        }
+
+        // Handle special cases.
+        match s {
+            "inf" | "INFINITY" => return Ok((Self::inf(), OpStatus::OK)),
+            "-inf" | "-INFINITY" => return Ok((-Self::inf(), OpStatus::OK)),
+            "nan" | "NaN" => return Ok((Self::nan(), OpStatus::OK)),
+            "-nan" | "-NaN" => return Ok((-Self::nan(), OpStatus::OK)),
+            _ => {}
+        }
+
+        // Handle a leading minus sign.
+        let minus = s.starts_with("-");
+        if minus || s.starts_with("+") {
+            s = &s[1..];
+            if s.is_empty() {
+                return Err(ParseError("String has no digits"));
+            }
+        }
+
+        // Adjust the rounding mode for the absolute value below.
+        if minus {
+            round = -round;
+        }
+
+        let (mut r, fs) = if s.starts_with("0x") || s.starts_with("0X") {
+            s = &s[2..];
+            if s.is_empty() {
+                return Err(ParseError("Invalid string"));
+            }
+            Self::from_hexadecimal_string(s, round)?
+        } else {
+            Self::from_decimal_string(s, round)?
+        };
+
+        if minus {
+            r.change_sign();
+        }
+
+        Ok((r, fs))
     }
 
     fn to_bits(self) -> u128 {
-        panic!("NYI to_bits")
+        // Dispatch to semantics.
+        S::to_bits(self)
     }
 
     fn to_u128(self, width: usize, round: Round, is_exact: &mut bool) -> (u128, OpStatus) {
-        panic!("NYI to_u128");
+        // The result of trying to convert a number too large.
+        let overflow = if self.sign {
+            // Negative numbers cannot be represented as unsigned.
+            0
+        } else {
+            // Largest unsigned integer of the given width.
+            !0 >> (128 - width)
+        };
+
+        *is_exact = false;
+
+        match self.category {
+            Category::NaN => (0, OpStatus::INVALID_OP),
+
+            Category::Infinity => (overflow, OpStatus::INVALID_OP),
+
+            Category::Zero => {
+                // Negative zero can't be represented as an int.
+                *is_exact = !self.sign;
+                (0, OpStatus::OK)
+            }
+
+            Category::Normal => {
+                let mut r = 0;
+
+                // Step 1: place our absolute value, with any fraction truncated, in
+                // the destination.
+                let truncated_bits = if self.exp < 0 {
+                    // Our absolute value is less than one; truncate everything.
+                    // For exponent -1 the integer bit represents .5, look at that.
+                    // For smaller exponents leftmost truncated bit is 0.
+                    S::PRECISION - 1 + (-self.exp) as usize
+                } else {
+                    // We want the most significant (exponent + 1) bits; the rest are
+                    // truncated.
+                    let bits = self.exp as usize + 1;
+
+                    // Hopelessly large in magnitude?
+                    if bits > width {
+                        return (overflow, OpStatus::INVALID_OP);
+                    }
+
+                    if bits < S::PRECISION {
+                        // We truncate (S::PRECISION - bits) bits.
+                        r = self.sig[0] >> (S::PRECISION - bits);
+                        S::PRECISION - bits
+                    } else {
+                        // We want at least as many bits as are available.
+                        r = self.sig[0] << (bits - S::PRECISION);
+                        0
+                    }
+                };
+
+                // Step 2: work out any lost fraction, and increment the absolute
+                // value if we would round away from zero.
+                let mut loss = Loss::ExactlyZero;
+                if truncated_bits > 0 {
+                    loss = Loss::through_truncation(&self.sig, truncated_bits);
+                    if loss != Loss::ExactlyZero &&
+                        self.round_away_from_zero(round, loss, truncated_bits)
+                    {
+                        r = r.wrapping_add(1);
+                        if r == 0 {
+                            return (overflow, OpStatus::INVALID_OP); // Overflow.
+                        }
+                    }
+                }
+
+                // Step 3: check if we fit in the destination.
+                if r > overflow {
+                    return (overflow, OpStatus::INVALID_OP);
+                }
+
+                if loss == Loss::ExactlyZero {
+                    *is_exact = true;
+                    (r, OpStatus::OK)
+                } else {
+                    (r, OpStatus::INEXACT)
+                }
+            }
+        }
     }
 
     fn cmp_abs_normal(self, rhs: Self) -> Ordering {
-        panic!("NYI cmp_abs_normal")
+        assert!(self.is_finite_non_zero());
+        assert!(rhs.is_finite_non_zero());
+
+        // If exponents are equal, do an unsigned comparison of the significands.
+        self.exp.cmp(&rhs.exp).then_with(
+            || sig::cmp(&self.sig, &rhs.sig),
+        )
     }
 
     fn bitwise_eq(self, rhs: Self) -> bool {
-        panic!("NYI bitwise_eq")
+        if self.category != rhs.category || self.sign != rhs.sign {
+            return false;
+        }
+
+        if self.category == Category::Zero || self.category == Category::Infinity {
+            return true;
+        }
+
+        if self.is_finite_non_zero() && self.exp != rhs.exp {
+            return false;
+        }
+
+        self.sig == rhs.sig
     }
 
     fn is_negative(self) -> bool {
-        panic!("NYI is_negative")
+        self.sign
     }
 
     fn is_denormal(self) -> bool {
-        panic!("NYI is_denormal")
+        self.is_finite_non_zero() && self.exp == S::MIN_EXPONENT &&
+            !sig::get_bit(&self.sig, S::PRECISION - 1)
     }
 
     fn is_signaling(self) -> bool {
-        panic!("NYI is_signaling")
+        // Ieee-754R 2008 6.2.1: A signaling NaN bit string should be encoded with the
+        // first bit of the trailing significand being 0.
+        self.is_nan() && !sig::get_bit(&self.sig, S::QNAN_BIT)
     }
 
     fn category(self) -> Category {
-        panic!("NYI category")
+        self.category
     }
 
     fn is_smallest(self) -> bool {
-        panic!("NYI is_smallest")
+        // The smallest number by magnitude in our format will be the smallest
+        // denormal, i.e. the floating point number with exponent being minimum
+        // exponent and significand bitwise equal to 1.
+        self.is_denormal() && self.sig == [1]
     }
 
     fn is_largest(self) -> bool {
-        panic!("NYI is_largest")
+        // The largest number by magnitude in our format will be the floating point
+        // number with maximum exponent and with significand that is all ones.
+        self.is_finite_non_zero() && self.exp == S::MAX_EXPONENT &&
+            self.sig == [!0 & ((1 << S::PRECISION) - 1)]
     }
 
     fn is_integer(self) -> bool {
-        panic!("NYI is_integer")
+        // This could be made more efficient; I'm going for obviously correct.
+        if !self.is_finite() {
+            return false;
+        }
+        let (truncated, _) = self.round_to_integral(Round::TowardZero);
+        self.partial_cmp(&truncated) == Some(Ordering::Equal)
     }
 
+    #[allow(unused)]
     fn get_exact_inverse(self) -> Option<Self> {
-        panic!("NYI get_exact_inverse")
+        // Special floats and denormals have no exact inverse.
+        if !self.is_finite_non_zero() {
+            return None;
+        }
+
+        // Check that the number is a power of two by making sure that only the
+        // integer bit is set in the significand.
+        if self.sig != [1 << (S::PRECISION - 1)] {
+            return None;
+        }
+
+        // Get the inverse.
+        let (mut reciprocal, _) = Self::from_u128(1, Round::NearestTiesToEven);
+        if reciprocal.div_rounded(self, Round::NearestTiesToEven) != OpStatus::OK {
+            return None;
+        }
+
+        // Avoid multiplication with a denormal, it is not safe on all platforms and
+        // may be slower than a normal division.
+        if reciprocal.is_denormal() {
+            return None;
+        }
+
+        assert!(reciprocal.is_finite_non_zero() && reciprocal.sig == [1 << (S::PRECISION - 1)]);
+
+        Some(reciprocal)
     }
 
-    fn ilogb(self) -> i32 {
-        panic!("NYI ilogb")
+    fn ilogb(mut self) -> i32 {
+        if self.is_nan() {
+            return IEK_NAN;
+        }
+        if self.is_zero() {
+            return IEK_ZERO;
+        }
+        if self.is_infinite() {
+            return IEK_INF;
+        }
+        if !self.is_denormal() {
+            return self.exp as i32;
+        }
+
+        let sig_bits = (S::PRECISION - 1) as ExpInt;
+        self.exp += sig_bits;
+        let _: OpStatus = self.normalize(Round::NearestTiesToEven, Loss::ExactlyZero);
+        (self.exp - sig_bits) as i32
     }
 
-    fn scalbn(self, exp: i32, round: Round) -> Self {
-        panic!("NYI scalbn")
+    fn scalbn(mut self, exp: i32, round: Round) -> Self {
+        // If exp is wildly out-of-scale, simply adding it to self.exp will
+        // overflow; clamp it to a safe range before adding, but ensure that the range
+        // is large enough that the clamp does not change the result. The range we
+        // need to support is the difference between the largest possible exponent and
+        // the normalized exponent of half the smallest denormal.
+
+        let sig_bits = (S::PRECISION - 1) as ExpInt;
+        let max_change = (S::MAX_EXPONENT - (S::MIN_EXPONENT - sig_bits) + 1) as i32;
+
+        // Clamp to one past the range ends to let normalize handle overlflow.
+        self.exp += cmp::min(cmp::max(exp, (-max_change - 1)), max_change) as ExpInt;
+        let _: OpStatus = self.normalize(round, Loss::ExactlyZero);
+        if self.is_nan() {
+            sig::set_bit(&mut self.sig, S::QNAN_BIT);
+        }
+        self
     }
 
-    fn frexp(self, exp: &mut i32, round: Round) -> Self {
-        panic!("NYI frexp")
+    fn frexp(mut self, exp: &mut i32, round: Round) -> Self {
+        *exp = self.ilogb();
+
+        // Quiet signalling nans.
+        if *exp == IEK_NAN {
+            sig::set_bit(&mut self.sig, S::QNAN_BIT);
+            return self;
+        }
+
+        if *exp == IEK_INF {
+            return self;
+        }
+
+        // 1 is added because frexp is defined to return a normalized fraction in
+        // +/-[0.5, 1.0), rather than the usual +/-[1.0, 2.0).
+        if *exp == IEK_ZERO {
+            *exp = 0;
+        } else {
+            *exp += 1;
+        }
+        self.scalbn(-*exp, round)
     }
 }
 
-#[allow(unused)]
 impl<S: IeeeSemantics> Ieee<S> {
+    /// Handle positive overflow. We either return infinity or
+    /// the largest finite number. For negative overflow,
+    /// negate the `round` argument before calling.
+    fn overflow_result(round: Round) -> (Self, OpStatus) {
+        match round {
+            // Infinity?
+            Round::NearestTiesToEven | Round::NearestTiesToAway | Round::TowardPositive => {
+                (Self::inf(), OpStatus::OVERFLOW | OpStatus::INEXACT)
+            }
+            // Otherwise we become the largest finite number.
+            Round::TowardNegative | Round::TowardZero => (Self::largest(), OpStatus::INEXACT),
+        }
+    }
+
+    /// Returns TRUE if, when truncating the current number, with BIT the
+    /// new LSB, with the given lost fraction and rounding mode, the result
+    /// would need to be rounded away from zero (i.e., by increasing the
+    /// signficand). This routine must work for Category::Zero of both signs, and
+    /// Category::Normal numbers.
+    fn round_away_from_zero(&self, round: Round, loss: Loss, bit: usize) -> bool {
+        // NaNs and infinities should not have lost fractions.
+        assert!(self.is_finite_non_zero() || self.category == Category::Zero);
+
+        // Current callers never pass this so we don't handle it.
+        assert_ne!(loss, Loss::ExactlyZero);
+
+        match round {
+            Round::NearestTiesToAway => loss == Loss::ExactlyHalf || loss == Loss::MoreThanHalf,
+            Round::NearestTiesToEven => {
+                if loss == Loss::MoreThanHalf {
+                    return true;
+                }
+
+                // Our zeros don't have a significand to test.
+                if loss == Loss::ExactlyHalf && self.category != Category::Zero {
+                    return sig::get_bit(&self.sig, bit);
+                }
+
+                false
+            }
+            Round::TowardZero => false,
+            Round::TowardPositive => !self.sign,
+            Round::TowardNegative => self.sign,
+        }
+    }
+
+    fn normalize(&mut self, round: Round, mut loss: Loss) -> OpStatus {
+        if !self.is_finite_non_zero() {
+            return OpStatus::OK;
+        }
+
+        // Before rounding normalize the exponent of Category::Normal numbers.
+        let mut omsb = sig::omsb(&self.sig);
+
+        if omsb > 0 {
+            // OMSB is numbered from 1. We want to place it in the integer
+            // bit numbered PRECISION if possible, with a compensating change in
+            // the exponent.
+            let mut final_exp = self.exp.saturating_add(
+                omsb as ExpInt - S::PRECISION as ExpInt,
+            );
+
+            // If the resulting exponent is too high, overflow according to
+            // the rounding mode.
+            if final_exp > S::MAX_EXPONENT {
+                let round = if self.sign { -round } else { round };
+                let (r, fs) = Self::overflow_result(round);
+                *self = r.copy_sign(*self);
+                return fs;
+            }
+
+            // Subnormal numbers have exponent MIN_EXPONENT, and their MSB
+            // is forced based on that.
+            if final_exp < S::MIN_EXPONENT {
+                final_exp = S::MIN_EXPONENT;
+            }
+
+            // Shifting left is easy as we don't lose precision.
+            if final_exp < self.exp {
+                assert_eq!(loss, Loss::ExactlyZero);
+
+                let exp_change = (self.exp - final_exp) as usize;
+                sig::shift_left(&mut self.sig, &mut self.exp, exp_change);
+
+                return OpStatus::OK;
+            }
+
+            // Shift right and capture any new lost fraction.
+            if final_exp > self.exp {
+                let exp_change = (final_exp - self.exp) as usize;
+                loss = sig::shift_right(&mut self.sig, &mut self.exp, exp_change).combine(loss);
+
+                // Keep OMSB up-to-date.
+                omsb = omsb.saturating_sub(exp_change);
+            }
+        }
+
+        // Now round the number according to round given the lost
+        // fraction.
+
+        // As specified in IEEE 754, since we do not trap we do not report
+        // underflow for exact results.
+        if loss == Loss::ExactlyZero {
+            // Canonicalize zeros.
+            if omsb == 0 {
+                self.category = Category::Zero;
+            }
+
+            return OpStatus::OK;
+        }
+
+        // Increment the significand if we're rounding away from zero.
+        if self.round_away_from_zero(round, loss, 0) {
+            if omsb == 0 {
+                self.exp = S::MIN_EXPONENT;
+            }
+
+            // We should never overflow.
+            assert_eq!(sig::increment(&mut self.sig), 0);
+            omsb = sig::omsb(&self.sig);
+
+            // Did the significand increment overflow?
+            if omsb == S::PRECISION + 1 {
+                // Renormalize by incrementing the exponent and shifting our
+                // significand right one. However if we already have the
+                // maximum exponent we overflow to infinity.
+                if self.exp == S::MAX_EXPONENT {
+                    self.category = Category::Infinity;
+
+                    return OpStatus::OVERFLOW | OpStatus::INEXACT;
+                }
+
+                let _: Loss = sig::shift_right(&mut self.sig, &mut self.exp, 1);
+
+                return OpStatus::INEXACT;
+            }
+        }
+
+        // The normal case - we were and are not denormal, and any
+        // significand increment above didn't overflow.
+        if omsb == S::PRECISION {
+            return OpStatus::INEXACT;
+        }
+
+        // We have a non-zero denormal.
+        assert!(omsb < S::PRECISION);
+
+        // Canonicalize zeros.
+        if omsb == 0 {
+            self.category = Category::Zero;
+        }
+
+        // The Category::Zero case is a denormal that underflowed to zero.
+        OpStatus::UNDERFLOW | OpStatus::INEXACT
+    }
+
+    fn from_hexadecimal_string(s: &str, round: Round) -> Result<(Self, OpStatus), ParseError> {
+        let mut r = Ieee {
+            sig: [0],
+            exp: 0,
+            category: Category::Normal,
+            sign: false,
+            marker: PhantomData,
+        };
+
+        let mut any_digits = false;
+        let mut has_exp = false;
+        let mut bit_pos = LIMB_BITS as isize;
+        let mut loss = None;
+
+        // Without leading or trailing zeros, irrespective of the dot.
+        let mut first_sig_digit = None;
+        let mut dot = s.len();
+
+        for (p, c) in s.char_indices() {
+            // Skip leading zeros and any (hexa)decimal point.
+            if c == '.' {
+                if dot != s.len() {
+                    return Err(ParseError("String contains multiple dots"));
+                }
+                dot = p;
+            } else if let Some(hex_value) = c.to_digit(16) {
+                any_digits = true;
+
+                if first_sig_digit.is_none() {
+                    if hex_value == 0 {
+                        continue;
+                    }
+                    first_sig_digit = Some(p);
+                }
+
+                // Store the number while we have space.
+                bit_pos -= 4;
+                if bit_pos >= 0 {
+                    r.sig[0] |= (hex_value as Limb) << bit_pos;
+                } else {
+                    // If zero or one-half (the hexadecimal digit 8) are followed
+                    // by non-zero, they're a little more than zero or one-half.
+                    if let Some(ref mut loss) = loss {
+                        if hex_value != 0 {
+                            if *loss == Loss::ExactlyZero {
+                                *loss = Loss::LessThanHalf;
+                            }
+                            if *loss == Loss::ExactlyHalf {
+                                *loss = Loss::MoreThanHalf;
+                            }
+                        }
+                    } else {
+                        loss = Some(match hex_value {
+                            0 => Loss::ExactlyZero,
+                            1...7 => Loss::LessThanHalf,
+                            8 => Loss::ExactlyHalf,
+                            9...15 => Loss::MoreThanHalf,
+                            _ => unreachable!(),
+                        });
+                    }
+                }
+            } else if c == 'p' || c == 'P' {
+                if !any_digits {
+                    return Err(ParseError("Significand has no digits"));
+                }
+
+                if dot == s.len() {
+                    dot = p;
+                }
+
+                let mut chars = s[p + 1..].chars().peekable();
+
+                // Adjust for the given exponent.
+                let exp_minus = chars.peek() == Some(&'-');
+                if exp_minus || chars.peek() == Some(&'+') {
+                    chars.next();
+                }
+
+                for c in chars {
+                    if let Some(value) = c.to_digit(10) {
+                        has_exp = true;
+                        r.exp = r.exp.saturating_mul(10).saturating_add(value as ExpInt);
+                    } else {
+                        return Err(ParseError("Invalid character in exponent"));
+                    }
+                }
+                if !has_exp {
+                    return Err(ParseError("Exponent has no digits"));
+                }
+
+                if exp_minus {
+                    r.exp = -r.exp;
+                }
+
+                break;
+            } else {
+                return Err(ParseError("Invalid character in significand"));
+            }
+        }
+        if !any_digits {
+            return Err(ParseError("Significand has no digits"));
+        }
+
+        // Hex floats require an exponent but not a hexadecimal point.
+        if !has_exp {
+            return Err(ParseError("Hex strings require an exponent"));
+        }
+
+        // Ignore the exponent if we are zero.
+        let first_sig_digit = match first_sig_digit {
+            Some(p) => p,
+            None => return Ok((Self::zero(), OpStatus::OK)),
+        };
+
+        // Calculate the exponent adjustment implicit in the number of
+        // significant digits and adjust for writing the significand starting
+        // at the most significant nibble.
+        let exp_adjustment = if dot > first_sig_digit {
+            ExpInt::try_from(dot - first_sig_digit).unwrap()
+        } else {
+            -ExpInt::try_from(first_sig_digit - dot - 1).unwrap()
+        };
+        let exp_adjustment = exp_adjustment
+            .saturating_mul(4)
+            .saturating_sub(1)
+            .saturating_add(S::PRECISION as ExpInt)
+            .saturating_sub(LIMB_BITS as ExpInt);
+        r.exp = r.exp.saturating_add(exp_adjustment);
+
+        let fs = r.normalize(round, loss.unwrap_or(Loss::ExactlyZero));
+        Ok((r, fs))
+    }
+
+    fn from_decimal_string(s: &str, round: Round) -> Result<(Self, OpStatus), ParseError> {
+        // Given a normal decimal floating point number of the form
+        //
+        //   dddd.dddd[eE][+-]ddd
+        //
+        // where the decimal point and exponent are optional, fill out the
+        // variables below. Exponent is appropriate if the significand is
+        // treated as an integer, and normalized_exp if the significand
+        // is taken to have the decimal point after a single leading
+        // non-zero digit.
+        //
+        // If the value is zero, first_sig_digit is None.
+
+        let mut any_digits = false;
+        let mut dec_exp = 0i32;
+
+        // Without leading or trailing zeros, irrespective of the dot.
+        let mut first_sig_digit = None;
+        let mut last_sig_digit = 0;
+        let mut dot = s.len();
+
+        for (p, c) in s.char_indices() {
+            if c == '.' {
+                if dot != s.len() {
+                    return Err(ParseError("String contains multiple dots"));
+                }
+                dot = p;
+            } else if let Some(dec_value) = c.to_digit(10) {
+                any_digits = true;
+
+                if dec_value != 0 {
+                    if first_sig_digit.is_none() {
+                        first_sig_digit = Some(p);
+                    }
+                    last_sig_digit = p;
+                }
+            } else if c == 'e' || c == 'E' {
+                if !any_digits {
+                    return Err(ParseError("Significand has no digits"));
+                }
+
+                if dot == s.len() {
+                    dot = p;
+                }
+
+                let mut chars = s[p + 1..].chars().peekable();
+
+                // Adjust for the given exponent.
+                let exp_minus = chars.peek() == Some(&'-');
+                if exp_minus || chars.peek() == Some(&'+') {
+                    chars.next();
+                }
+
+                any_digits = false;
+                for c in chars {
+                    if let Some(value) = c.to_digit(10) {
+                        any_digits = true;
+                        dec_exp = dec_exp.saturating_mul(10).saturating_add(value as i32);
+                    } else {
+                        return Err(ParseError("Invalid character in exponent"));
+                    }
+                }
+                if !any_digits {
+                    return Err(ParseError("Exponent has no digits"));
+                }
+
+                if exp_minus {
+                    dec_exp = -dec_exp;
+                }
+
+                break;
+            } else {
+                return Err(ParseError("Invalid character in significand"));
+            }
+        }
+        if !any_digits {
+            return Err(ParseError("Significand has no digits"));
+        }
+
+        // Test if we have a zero number allowing for non-zero exponents.
+        let first_sig_digit = match first_sig_digit {
+            Some(p) => p,
+            None => return Ok((Self::zero(), OpStatus::OK)),
+        };
+
+        // Adjust the exponents for any decimal point.
+        if dot > last_sig_digit {
+            dec_exp = dec_exp.saturating_add((dot - last_sig_digit - 1) as i32);
+        } else {
+            dec_exp = dec_exp.saturating_sub((last_sig_digit - dot) as i32);
+        }
+        let significand_digits = last_sig_digit - first_sig_digit + 1 -
+            (dot > first_sig_digit && dot < last_sig_digit) as usize;
+        let normalized_exp = dec_exp.saturating_add(significand_digits as i32 - 1);
+
+        // Handle the cases where exponents are obviously too large or too
+        // small. Writing L for log 10 / log 2, a number d.ddddd*10^dec_exp
+        // definitely overflows if
+        //
+        //       (dec_exp - 1) * L >= MAX_EXPONENT
+        //
+        // and definitely underflows to zero where
+        //
+        //       (dec_exp + 1) * L <= MIN_EXPONENT - PRECISION
+        //
+        // With integer arithmetic the tightest bounds for L are
+        //
+        //       93/28 < L < 196/59            [ numerator <= 256 ]
+        //       42039/12655 < L < 28738/8651  [ numerator <= 65536 ]
+
+        // Check for MAX_EXPONENT.
+        if normalized_exp.saturating_sub(1).saturating_mul(42039) >=
+            12655 * S::MAX_EXPONENT as i32
+        {
+            // Overflow and round.
+            return Ok(Self::overflow_result(round));
+        }
+
+        // Check for MIN_EXPONENT.
+        if normalized_exp.saturating_add(1).saturating_mul(28738) <=
+            8651 * (S::MIN_EXPONENT as i32 - S::PRECISION as i32)
+        {
+            // Underflow to zero and round.
+            let r = if round == Round::TowardPositive {
+                Ieee::smallest()
+            } else {
+                Ieee::zero()
+            };
+            return Ok((r, OpStatus::UNDERFLOW | OpStatus::INEXACT));
+        }
+
+        // A tight upper bound on number of bits required to hold an
+        // N-digit decimal integer is N * 196 / 59. Allocate enough space
+        // to hold the full significand, and an extra limb required by
+        // tcMultiplyPart.
+        let max_limbs = limbs_for_bits(1 + 196 * significand_digits / 59);
+        let mut dec_sig = Vec::with_capacity(max_limbs);
+
+        // Convert to binary efficiently - we do almost all multiplication
+        // in a Limb. When this would overflow do we do a single
+        // bignum multiplication, and then revert again to multiplication
+        // in a Limb.
+        let mut chars = s[first_sig_digit..last_sig_digit + 1].chars();
+        loop {
+            let mut val = 0;
+            let mut multiplier = 1;
+
+            loop {
+                let dec_value = match chars.next() {
+                    Some('.') => continue,
+                    Some(c) => c.to_digit(10).unwrap(),
+                    None => break,
+                };
+
+                multiplier *= 10;
+                val = val * 10 + dec_value as Limb;
+
+                // The maximum number that can be multiplied by ten with any
+                // digit added without overflowing a Limb.
+                if multiplier > (!0 - 9) / 10 {
+                    break;
+                }
+            }
+
+            // If we've consumed no digits, we're done.
+            if multiplier == 1 {
+                break;
+            }
+
+            // Multiply out the current limb.
+            let mut carry = val;
+            for x in &mut dec_sig {
+                let [low, mut high] = sig::widening_mul(*x, multiplier);
+
+                // Now add carry.
+                let (low, overflow) = low.overflowing_add(carry);
+                high += overflow as Limb;
+
+                *x = low;
+                carry = high;
+            }
+
+            // If we had carry, we need another limb (likely but not guaranteed).
+            if carry > 0 {
+                dec_sig.push(carry);
+            }
+        }
+
+        // Calculate pow(5, abs(dec_exp)) into `pow5_full`.
+        // The *_calc Vec's are reused scratch space, as an optimization.
+        let (pow5_full, mut pow5_calc, mut sig_calc, mut sig_scratch_calc) = {
+            let mut power = dec_exp.abs() as usize;
+
+            const FIRST_EIGHT_POWERS: [Limb; 8] = [1, 5, 25, 125, 625, 3125, 15625, 78125];
+
+            let mut p5_scratch = vec![];
+            let mut p5 = vec![FIRST_EIGHT_POWERS[4]];
+
+            let mut r_scratch = vec![];
+            let mut r = vec![FIRST_EIGHT_POWERS[power & 7]];
+            power >>= 3;
+
+            while power > 0 {
+                // Calculate pow(5,pow(2,n+3)).
+                p5_scratch.resize(p5.len() * 2, 0);
+                let _: Loss = sig::mul(&mut p5_scratch, &mut 0, &p5, &p5, p5.len() * 2 * LIMB_BITS);
+                while p5_scratch.last() == Some(&0) {
+                    p5_scratch.pop();
+                }
+                mem::swap(&mut p5, &mut p5_scratch);
+
+                if power & 1 != 0 {
+                    r_scratch.resize(r.len() + p5.len(), 0);
+                    let _: Loss = sig::mul(
+                        &mut r_scratch,
+                        &mut 0,
+                        &r,
+                        &p5,
+                        (r.len() + p5.len()) * LIMB_BITS,
+                    );
+                    while r_scratch.last() == Some(&0) {
+                        r_scratch.pop();
+                    }
+                    mem::swap(&mut r, &mut r_scratch);
+                }
+
+                power >>= 1;
+            }
+
+            (r, r_scratch, p5, p5_scratch)
+        };
+
+        // Attempt dec_sig * 10^dec_exp with increasing precision.
+        let mut attempt = 1;
+        loop {
+            let calc_precision = (LIMB_BITS << attempt) - 1;
+            attempt += 1;
+
+            let calc_normal_from_limbs = |sig: &mut Vec<Limb>,
+                                          limbs: &[Limb]|
+             -> (ExpInt, OpStatus) {
+                sig.resize(limbs_for_bits(calc_precision), 0);
+                let (mut loss, mut exp) = sig::from_limbs(sig, limbs, calc_precision);
+
+                // Before rounding normalize the exponent of Category::Normal numbers.
+                let mut omsb = sig::omsb(sig);
+
+                assert_ne!(omsb, 0);
+
+                // OMSB is numbered from 1. We want to place it in the integer
+                // bit numbered PRECISION if possible, with a compensating change in
+                // the exponent.
+                let final_exp = exp.saturating_add(omsb as ExpInt - calc_precision as ExpInt);
+
+                // Shifting left is easy as we don't lose precision.
+                if final_exp < exp {
+                    assert_eq!(loss, Loss::ExactlyZero);
+
+                    let exp_change = (exp - final_exp) as usize;
+                    sig::shift_left(sig, &mut exp, exp_change);
+
+                    return (exp, OpStatus::OK);
+                }
+
+                // Shift right and capture any new lost fraction.
+                if final_exp > exp {
+                    let exp_change = (final_exp - exp) as usize;
+                    loss = sig::shift_right(sig, &mut exp, exp_change).combine(loss);
+
+                    // Keep OMSB up-to-date.
+                    omsb = omsb.saturating_sub(exp_change);
+                }
+
+                assert_eq!(omsb, calc_precision);
+
+                // Now round the number according to round given the lost
+                // fraction.
+
+                // As specified in IEEE 754, since we do not trap we do not report
+                // underflow for exact results.
+                if loss == Loss::ExactlyZero {
+                    return (exp, OpStatus::OK);
+                }
+
+                // Increment the significand if we're rounding away from zero.
+                if loss == Loss::MoreThanHalf || loss == Loss::ExactlyHalf && sig::get_bit(sig, 0) {
+                    // We should never overflow.
+                    assert_eq!(sig::increment(sig), 0);
+                    omsb = sig::omsb(sig);
+
+                    // Did the significand increment overflow?
+                    if omsb == calc_precision + 1 {
+                        let _: Loss = sig::shift_right(sig, &mut exp, 1);
+
+                        return (exp, OpStatus::INEXACT);
+                    }
+                }
+
+                // The normal case - we were and are not denormal, and any
+                // significand increment above didn't overflow.
+                (exp, OpStatus::INEXACT)
+            };
+
+            let (mut exp, fs) = calc_normal_from_limbs(&mut sig_calc, &dec_sig);
+            let (pow5_exp, pow5_fs) = calc_normal_from_limbs(&mut pow5_calc, &pow5_full);
+
+            // Add dec_exp, as 10^n = 5^n * 2^n.
+            exp += dec_exp as ExpInt;
+
+            let mut used_bits = S::PRECISION;
+            let mut truncated_bits = calc_precision - used_bits;
+
+            let half_ulp_err1 = (fs != OpStatus::OK) as Limb;
+            let (calc_loss, half_ulp_err2);
+            if dec_exp >= 0 {
+                exp += pow5_exp;
+
+                sig_scratch_calc.resize(sig_calc.len() + pow5_calc.len(), 0);
+                calc_loss = sig::mul(
+                    &mut sig_scratch_calc,
+                    &mut exp,
+                    &sig_calc,
+                    &pow5_calc,
+                    calc_precision,
+                );
+                mem::swap(&mut sig_calc, &mut sig_scratch_calc);
+
+                half_ulp_err2 = (pow5_fs != OpStatus::OK) as Limb;
+            } else {
+                exp -= pow5_exp;
+
+                sig_scratch_calc.resize(sig_calc.len(), 0);
+                calc_loss = sig::div(
+                    &mut sig_scratch_calc,
+                    &mut exp,
+                    &mut sig_calc,
+                    &mut pow5_calc,
+                    calc_precision,
+                );
+                mem::swap(&mut sig_calc, &mut sig_scratch_calc);
+
+                // Denormal numbers have less precision.
+                if exp < S::MIN_EXPONENT {
+                    truncated_bits += (S::MIN_EXPONENT - exp) as usize;
+                    used_bits = calc_precision.saturating_sub(truncated_bits);
+                }
+                // Extra half-ulp lost in reciprocal of exponent.
+                half_ulp_err2 = 2 *
+                    (pow5_fs != OpStatus::OK || calc_loss != Loss::ExactlyZero) as Limb;
+            }
+
+            // Both sig::mul and sig::div return the
+            // result with the integer bit set.
+            assert!(sig::get_bit(&sig_calc, calc_precision - 1));
+
+            // The error from the true value, in half-ulps, on multiplying two
+            // floating point numbers, which differ from the value they
+            // approximate by at most half_ulp_err1 and half_ulp_err2 half-ulps, is strictly less
+            // than the returned value.
+            //
+            // See "How to Read Floating Point Numbers Accurately" by William D Clinger.
+            assert!(half_ulp_err1 < 2 || half_ulp_err2 < 2 || (half_ulp_err1 + half_ulp_err2 < 8));
+
+            let inexact = (calc_loss != Loss::ExactlyZero) as Limb;
+            let half_ulp_err = if half_ulp_err1 + half_ulp_err2 == 0 {
+                inexact * 2 // <= inexact half-ulps.
+            } else {
+                inexact + 2 * (half_ulp_err1 + half_ulp_err2)
+            };
+
+            let ulps_from_boundary = {
+                let bits = calc_precision - used_bits - 1;
+
+                let i = bits / LIMB_BITS;
+                let limb = sig_calc[i] & (!0 >> (LIMB_BITS - 1 - bits % LIMB_BITS));
+                let boundary = match round {
+                    Round::NearestTiesToEven | Round::NearestTiesToAway => 1 << (bits % LIMB_BITS),
+                    _ => 0,
+                };
+                if i == 0 {
+                    let delta = limb.wrapping_sub(boundary);
+                    cmp::min(delta, delta.wrapping_neg())
+                } else if limb == boundary {
+                    if !sig::is_zero(&sig_calc[1..i]) {
+                        !0 // A lot.
+                    } else {
+                        sig_calc[0]
+                    }
+                } else if limb == boundary.wrapping_sub(1) {
+                    if sig_calc[1..i].iter().any(|&x| x.wrapping_neg() != 1) {
+                        !0 // A lot.
+                    } else {
+                        sig_calc[0].wrapping_neg()
+                    }
+                } else {
+                    !0 // A lot.
+                }
+            };
+
+            // Are we guaranteed to round correctly if we truncate?
+            if ulps_from_boundary.saturating_mul(2) >= half_ulp_err {
+                let mut r = Ieee {
+                    sig: [0],
+                    exp,
+                    category: Category::Normal,
+                    sign: false,
+                    marker: PhantomData,
+                };
+                sig::extract(&mut r.sig, &sig_calc, used_bits, calc_precision - used_bits);
+                // If we extracted less bits above we must adjust our exponent
+                // to compensate for the implicit right shift.
+                r.exp += (S::PRECISION - used_bits) as ExpInt;
+                let loss = Loss::through_truncation(&sig_calc, truncated_bits);
+                let fs = r.normalize(round, loss);
+                return Ok((r, fs));
+            }
+        }
+    }
+
     /// IEEE::convert - convert a value of one floating point type to another.
     /// The return value corresponds to the IEEE754 exceptions. *loses_info
     /// records whether the transformation lost information, i.e. whether
@@ -814,160 +2762,1056 @@ impl<S: IeeeSemantics> Ieee<S> {
         round: Round,
         loses_info: &mut bool,
     ) -> (Ieee<T>, OpStatus) {
-        panic!("NYI convert");
+        let mut r = Ieee {
+            sig: self.sig,
+            exp: self.exp,
+            category: self.category,
+            sign: self.sign,
+            marker: PhantomData,
+        };
+
+        // x86 has some unusual NaNs which cannot be represented in any other
+        // format; note them here.
+        fn is_x87_double_extended<S: IeeeSemantics>() -> bool {
+            S::QNAN_SIGNIFICAND == ieee_semantics::X87DoubleExtended::QNAN_SIGNIFICAND
+        }
+        let x87_special_nan = is_x87_double_extended::<S>() && !is_x87_double_extended::<T>() &&
+            r.category == Category::NaN &&
+            (r.sig[0] & S::QNAN_SIGNIFICAND) != S::QNAN_SIGNIFICAND;
+
+        // If this is a truncation of a denormal number, and the target semantics
+        // has larger exponent range than the source semantics (this can happen
+        // when truncating from PowerPC double-double to double format), the
+        // right shift could lose result mantissa bits. Adjust exponent instead
+        // of performing excessive shift.
+        let mut shift = T::PRECISION as ExpInt - S::PRECISION as ExpInt;
+        if shift < 0 && r.is_finite_non_zero() {
+            let mut exp_change = sig::omsb(&r.sig) as ExpInt - S::PRECISION as ExpInt;
+            if r.exp + exp_change < T::MIN_EXPONENT {
+                exp_change = T::MIN_EXPONENT - r.exp;
+            }
+            if exp_change < shift {
+                exp_change = shift;
+            }
+            if exp_change < 0 {
+                shift -= exp_change;
+                r.exp += exp_change;
+            }
+        }
+
+        // If this is a truncation, perform the shift.
+        let mut loss = Loss::ExactlyZero;
+        if shift < 0 && (r.is_finite_non_zero() || r.category == Category::NaN) {
+            loss = sig::shift_right(&mut r.sig, &mut 0, -shift as usize);
+        }
+
+        // If this is an extension, perform the shift.
+        if shift > 0 && (r.is_finite_non_zero() || r.category == Category::NaN) {
+            sig::shift_left(&mut r.sig, &mut 0, shift as usize);
+        }
+
+        let fs;
+        if r.is_finite_non_zero() {
+            fs = r.normalize(round, loss);
+            *loses_info = fs != OpStatus::OK;
+        } else if r.category == Category::NaN {
+            *loses_info = loss != Loss::ExactlyZero || x87_special_nan;
+
+            // For x87 extended precision, we want to make a NaN, not a special NaN if
+            // the input wasn't special either.
+            if !x87_special_nan && is_x87_double_extended::<T>() {
+                sig::set_bit(&mut r.sig, T::PRECISION - 1);
+            }
+
+            // gcc forces the Quiet bit on, which means (float)(double)(float_sNan)
+            // does not give you back the same bits. This is dubious, and we
+            // don't currently do it. You're really supposed to get
+            // an invalid operation signal at runtime, but nobody does that.
+            fs = OpStatus::OK;
+        } else {
+            *loses_info = false;
+            fs = OpStatus::OK;
+        }
+
+        (r, fs)
     }
 }
 
-#[derive(Copy, Clone, PartialOrd, Debug)]
+impl Loss {
+    /// Combine the effect of two lost fractions.
+    fn combine(self, less_significant: Loss) -> Loss {
+        let mut more_significant = self;
+        if less_significant != Loss::ExactlyZero {
+            if more_significant == Loss::ExactlyZero {
+                more_significant = Loss::LessThanHalf;
+            } else if more_significant == Loss::ExactlyHalf {
+                more_significant = Loss::MoreThanHalf;
+            }
+        }
+
+        more_significant
+    }
+
+    /// Return the fraction lost were a bignum truncated losing the least
+    /// significant BITS bits.
+    fn through_truncation(limbs: &[Limb], bits: usize) -> Loss {
+        if bits == 0 {
+            return Loss::ExactlyZero;
+        }
+
+        let half_bit = bits - 1;
+        let half_limb = half_bit / LIMB_BITS;
+        let (half_limb, rest) = if half_limb < limbs.len() {
+            (limbs[half_limb], &limbs[..half_limb])
+        } else {
+            (0, limbs)
+        };
+        let half = 1 << (half_bit % LIMB_BITS);
+        let has_half = half_limb & half != 0;
+        let has_rest = half_limb & (half - 1) != 0 || !sig::is_zero(rest);
+
+        match (has_half, has_rest) {
+            (false, false) => Loss::ExactlyZero,
+            (false, true) => Loss::LessThanHalf,
+            (true, false) => Loss::ExactlyHalf,
+            (true, true) => Loss::MoreThanHalf,
+        }
+    }
+}
+
+/// Implementation details of Ieee significands, such as big integer arithmetic.
+/// As a rule of thumb, no functions in this module should dynamically allocate.
+mod sig {
+    use std::cmp::Ordering;
+    use std::mem;
+    use super::{ExpInt, Limb, LIMB_BITS, limbs_for_bits, Loss};
+
+    pub(super) fn is_zero(limbs: &[Limb]) -> bool {
+        limbs.iter().all(|&l| l == 0)
+    }
+
+    /// One, not zero, based MSB. That is, returns 0 for a zeroed significand.
+    pub(super) fn omsb(limbs: &[Limb]) -> usize {
+        for i in (0..limbs.len()).rev() {
+            if limbs[i] != 0 {
+                return (i + 1) * LIMB_BITS - limbs[i].leading_zeros() as usize;
+            }
+        }
+
+        0
+    }
+
+    /// Comparison (unsigned) of two significands.
+    pub(super) fn cmp(a: &[Limb], b: &[Limb]) -> Ordering {
+        assert_eq!(a.len(), b.len());
+        for (a, b) in a.iter().zip(b).rev() {
+            match a.cmp(b) {
+                Ordering::Equal => {}
+                o => return o,
+            }
+        }
+
+        Ordering::Equal
+    }
+
+    /// Extract the given bit.
+    pub(super) fn get_bit(limbs: &[Limb], bit: usize) -> bool {
+        limbs[bit / LIMB_BITS] & (1 << (bit % LIMB_BITS)) != 0
+    }
+
+    /// Set the given bit.
+    pub(super) fn set_bit(limbs: &mut [Limb], bit: usize) {
+        limbs[bit / LIMB_BITS] |= 1 << (bit % LIMB_BITS);
+    }
+
+    /// Clear the given bit.
+    pub(super) fn clear_bit(limbs: &mut [Limb], bit: usize) {
+        limbs[bit / LIMB_BITS] &= !(1 << (bit % LIMB_BITS));
+    }
+
+    /// Shift DST left BITS bits, subtract BITS from its exponent.
+    pub(super) fn shift_left(dst: &mut [Limb], exp: &mut ExpInt, bits: usize) {
+        if bits > 0 {
+            // Our exponent should not underflow.
+            *exp = exp.checked_sub(bits as ExpInt).unwrap();
+
+            // Jump is the inter-limb jump; shift is is intra-limb shift.
+            let jump = bits / LIMB_BITS;
+            let shift = bits % LIMB_BITS;
+
+            for i in (0..dst.len()).rev() {
+                let mut limb;
+
+                if i < jump {
+                    limb = 0;
+                } else {
+                    // dst[i] comes from the two limbs src[i - jump] and, if we have
+                    // an intra-limb shift, src[i - jump - 1].
+                    limb = dst[i - jump];
+                    if shift > 0 {
+                        limb <<= shift;
+                        if i >= jump + 1 {
+                            limb |= dst[i - jump - 1] >> (LIMB_BITS - shift);
+                        }
+                    }
+                }
+
+                dst[i] = limb;
+            }
+        }
+    }
+
+    /// Shift DST right BITS bits noting lost fraction.
+    pub(super) fn shift_right(dst: &mut [Limb], exp: &mut ExpInt, bits: usize) -> Loss {
+        let loss = Loss::through_truncation(dst, bits);
+
+        if bits > 0 {
+            // Our exponent should not overflow.
+            *exp = exp.checked_add(bits as ExpInt).unwrap();
+
+            // Jump is the inter-limb jump; shift is is intra-limb shift.
+            let jump = bits / LIMB_BITS;
+            let shift = bits % LIMB_BITS;
+
+            // Perform the shift. This leaves the most significant BITS bits
+            // of the result at zero.
+            for i in 0..dst.len() {
+                let mut limb;
+
+                if i + jump >= dst.len() {
+                    limb = 0;
+                } else {
+                    limb = dst[i + jump];
+                    if shift > 0 {
+                        limb >>= shift;
+                        if i + jump + 1 < dst.len() {
+                            limb |= dst[i + jump + 1] << (LIMB_BITS - shift);
+                        }
+                    }
+                }
+
+                dst[i] = limb;
+            }
+        }
+
+        loss
+    }
+
+    /// Copy the bit vector of width SRC_BITS from SRC, starting at bit SRC_LSB,
+    /// to DST, such that the bit SRC_LSB becomes the least significant bit of DST.
+    /// All high bits above SRC_BITS in DST are zero-filled.
+    pub(super) fn extract(dst: &mut [Limb], src: &[Limb], src_bits: usize, src_lsb: usize) {
+        if src_bits == 0 {
+            return;
+        }
+
+        let dst_limbs = limbs_for_bits(src_bits);
+        assert!(dst_limbs <= dst.len());
+
+        let src = &src[src_lsb / LIMB_BITS..];
+        dst[..dst_limbs].copy_from_slice(&src[..dst_limbs]);
+
+        let shift = src_lsb % LIMB_BITS;
+        let _: Loss = shift_right(&mut dst[..dst_limbs], &mut 0, shift);
+
+        // We now have (dst_limbs * LIMB_BITS - shift) bits from SRC
+        // in DST.  If this is less that src_bits, append the rest, else
+        // clear the high bits.
+        let n = dst_limbs * LIMB_BITS - shift;
+        if n < src_bits {
+            let mask = (1 << (src_bits - n)) - 1;
+            dst[dst_limbs - 1] |= (src[dst_limbs] & mask) << n % LIMB_BITS;
+        } else if n > src_bits && src_bits % LIMB_BITS > 0 {
+            dst[dst_limbs - 1] &= (1 << (src_bits % LIMB_BITS)) - 1;
+        }
+
+        // Clear high limbs.
+        for x in &mut dst[dst_limbs..] {
+            *x = 0;
+        }
+    }
+
+    /// We want the most significant PRECISION bits of SRC. There may not
+    /// be that many; extract what we can.
+    pub(super) fn from_limbs(dst: &mut [Limb], src: &[Limb], precision: usize) -> (Loss, ExpInt) {
+        let omsb = omsb(src);
+
+        if precision <= omsb {
+            extract(dst, src, precision, omsb - precision);
+            (
+                Loss::through_truncation(src, omsb - precision),
+                omsb as ExpInt - 1,
+            )
+        } else {
+            extract(dst, src, omsb, 0);
+            (Loss::ExactlyZero, precision as ExpInt - 1)
+        }
+    }
+
+    /// Increment in-place, return the carry flag.
+    pub(super) fn increment(dst: &mut [Limb]) -> Limb {
+        for x in dst {
+            *x = x.wrapping_add(1);
+            if *x != 0 {
+                return 0;
+            }
+        }
+
+        1
+    }
+
+    /// Decrement in-place, return the borrow flag.
+    pub(super) fn decrement(dst: &mut [Limb]) -> Limb {
+        for x in dst {
+            *x = x.wrapping_sub(1);
+            if *x != !0 {
+                return 0;
+            }
+        }
+
+        1
+    }
+
+    /// A += B + C where C is zero or one. Returns the carry flag.
+    pub(super) fn add(a: &mut [Limb], b: &[Limb], mut c: Limb) -> Limb {
+        assert!(c <= 1);
+
+        for (a, &b) in a.iter_mut().zip(b) {
+            let (r, overflow) = a.overflowing_add(b);
+            let (r, overflow2) = r.overflowing_add(c);
+            *a = r;
+            c = (overflow | overflow2) as Limb;
+        }
+
+        c
+    }
+
+    /// A -= B + C where C is zero or one. Returns the borrow flag.
+    pub(super) fn sub(a: &mut [Limb], b: &[Limb], mut c: Limb) -> Limb {
+        assert!(c <= 1);
+
+        for (a, &b) in a.iter_mut().zip(b) {
+            let (r, overflow) = a.overflowing_sub(b);
+            let (r, overflow2) = r.overflowing_sub(c);
+            *a = r;
+            c = (overflow | overflow2) as Limb;
+        }
+
+        c
+    }
+
+    /// A += B or A -= B. Does not preserve B.
+    pub(super) fn add_or_sub(
+        a_sig: &mut [Limb],
+        a_exp: &mut ExpInt,
+        a_sign: &mut bool,
+        b_sig: &mut [Limb],
+        b_exp: ExpInt,
+        b_sign: bool,
+    ) -> Loss {
+        // Are we bigger exponent-wise than the RHS?
+        let bits = *a_exp - b_exp;
+
+        // Determine if the operation on the absolute values is effectively
+        // an addition or subtraction.
+        // Subtraction is more subtle than one might naively expect.
+        if *a_sign ^ b_sign {
+            let (reverse, loss);
+
+            if bits == 0 {
+                reverse = cmp(a_sig, b_sig) == Ordering::Less;
+                loss = Loss::ExactlyZero;
+            } else if bits > 0 {
+                loss = shift_right(b_sig, &mut 0, (bits - 1) as usize);
+                shift_left(a_sig, a_exp, 1);
+                reverse = false;
+            } else {
+                loss = shift_right(a_sig, a_exp, (-bits - 1) as usize);
+                shift_left(b_sig, &mut 0, 1);
+                reverse = true;
+            }
+
+            let borrow = (loss != Loss::ExactlyZero) as Limb;
+            if reverse {
+                // The code above is intended to ensure that no borrow is necessary.
+                assert_eq!(sub(b_sig, a_sig, borrow), 0);
+                a_sig.copy_from_slice(b_sig);
+                *a_sign = !*a_sign;
+            } else {
+                // The code above is intended to ensure that no borrow is necessary.
+                assert_eq!(sub(a_sig, b_sig, borrow), 0);
+            }
+
+            // Invert the lost fraction - it was on the RHS and subtracted.
+            match loss {
+                Loss::LessThanHalf => Loss::MoreThanHalf,
+                Loss::MoreThanHalf => Loss::LessThanHalf,
+                _ => loss,
+            }
+        } else {
+            let loss = if bits > 0 {
+                shift_right(b_sig, &mut 0, bits as usize)
+            } else {
+                shift_right(a_sig, a_exp, -bits as usize)
+            };
+            // We have a guard bit; generating a carry cannot happen.
+            assert_eq!(add(a_sig, b_sig, 0), 0);
+            loss
+        }
+    }
+
+    /// [LOW, HIGH] = A * B.
+    ///
+    /// This cannot overflow, because
+    ///
+    /// (n - 1) * (n - 1) + 2 (n - 1) = (n - 1) * (n + 1)
+    ///
+    /// which is less than n^2.
+    pub(super) fn widening_mul(a: Limb, b: Limb) -> [Limb; 2] {
+        let mut wide = [0, 0];
+
+        if a == 0 || b == 0 {
+            return wide;
+        }
+
+        const HALF_BITS: usize = LIMB_BITS / 2;
+
+        let select = |limb, i| (limb >> (i * HALF_BITS)) & ((1 << HALF_BITS) - 1);
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut x = [select(a, i) * select(b, j), 0];
+                shift_left(&mut x, &mut 0, (i + j) * HALF_BITS);
+                assert_eq!(add(&mut wide, &x, 0), 0);
+            }
+        }
+
+        wide
+    }
+
+    /// Multiply (normal) A by B into DST. Returns the lost fraction.
+    pub(super) fn mul<'a>(
+        dst: &mut [Limb],
+        exp: &mut ExpInt,
+        mut a: &'a [Limb],
+        mut b: &'a [Limb],
+        precision: usize,
+    ) -> Loss {
+        // Put the narrower number on the A for less loops below.
+        if a.len() > b.len() {
+            mem::swap(&mut a, &mut b);
+        }
+
+        for x in &mut dst[..b.len()] {
+            *x = 0;
+        }
+
+        for i in 0..a.len() {
+            let mut carry = 0;
+            for j in 0..b.len() {
+                let [low, mut high] = widening_mul(a[i], b[j]);
+
+                // Now add carry.
+                let (low, overflow) = low.overflowing_add(carry);
+                high += overflow as Limb;
+
+                // And now DST[i + j], and store the new low part there.
+                let (low, overflow) = low.overflowing_add(dst[i + j]);
+                high += overflow as Limb;
+
+                dst[i + j] = low;
+                carry = high;
+            }
+            dst[i + b.len()] = carry;
+        }
+
+        // Assume the operands involved in the multiplication are single-precision
+        // FP, and the two multiplicants are:
+        //     a = a23 . a22 ... a0 * 2^e1
+        //     b = b23 . b22 ... b0 * 2^e2
+        // the result of multiplication is:
+        //     dst = c48 c47 c46 . c45 ... c0 * 2^(e1+e2)
+        // Note that there are three significant bits at the left-hand side of the
+        // radix point: two for the multiplication, and an overflow bit for the
+        // addition (that will always be zero at this point). Move the radix point
+        // toward left by two bits, and adjust exponent accordingly.
+        *exp += 2;
+
+        // Convert the result having "2 * precision" significant-bits back to the one
+        // having "precision" significant-bits. First, move the radix point from
+        // poision "2*precision - 1" to "precision - 1". The exponent need to be
+        // adjusted by "2*precision - 1" - "precision - 1" = "precision".
+        *exp -= precision as ExpInt + 1;
+
+        // In case MSB resides at the left-hand side of radix point, shift the
+        // mantissa right by some amount to make sure the MSB reside right before
+        // the radix point (i.e. "MSB . rest-significant-bits").
+        //
+        // Note that the result is not normalized when "omsb < precision". So, the
+        // caller needs to call Ieee::normalize() if normalized value is
+        // expected.
+        let omsb = omsb(dst);
+        if omsb <= precision {
+            Loss::ExactlyZero
+        } else {
+            shift_right(dst, exp, omsb - precision)
+        }
+    }
+
+    /// Divide DIVIDEND by DIVISOR into QUOTIENT. Returns the lost fraction.
+    /// Does not preserve DIVIDEND or DIVISOR.
+    pub(super) fn div(
+        quotient: &mut [Limb],
+        exp: &mut ExpInt,
+        dividend: &mut [Limb],
+        divisor: &mut [Limb],
+        precision: usize,
+    ) -> Loss {
+        // Zero the quotient before setting bits in it.
+        for x in &mut quotient[..limbs_for_bits(precision)] {
+            *x = 0;
+        }
+
+        // Normalize the divisor.
+        let bits = precision - omsb(divisor);
+        shift_left(divisor, &mut 0, bits);
+        *exp += bits as ExpInt;
+
+        // Normalize the dividend.
+        let bits = precision - omsb(dividend);
+        shift_left(dividend, exp, bits);
+
+        // Ensure the dividend >= divisor initially for the loop below.
+        // Incidentally, this means that the division loop below is
+        // guaranteed to set the integer bit to one.
+        if cmp(dividend, divisor) == Ordering::Less {
+            shift_left(dividend, exp, 1);
+            assert_ne!(cmp(dividend, divisor), Ordering::Less)
+        }
+
+        // Long division.
+        for bit in (0..precision).rev() {
+            if cmp(dividend, divisor) != Ordering::Less {
+                sub(dividend, divisor, 0);
+                set_bit(quotient, bit);
+            }
+            shift_left(dividend, &mut 0, 1);
+        }
+
+        // Figure out the lost fraction.
+        match cmp(dividend, divisor) {
+            Ordering::Greater => Loss::MoreThanHalf,
+            Ordering::Equal => Loss::ExactlyHalf,
+            Ordering::Less => {
+                if is_zero(dividend) {
+                    Loss::ExactlyZero
+                } else {
+                    Loss::LessThanHalf
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct IeeePair<S: IeeeSemantics>(Ieee<S>, Ieee<S>);
 
+impl<S: IeeeSemantics> Copy for IeeePair<S> {}
+impl<S: IeeeSemantics> Clone for IeeePair<S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[derive(Debug)]
+pub struct IeeePairLegacySemantics<S: IeeeSemantics>(S);
+pub type IeeePairLegacy<S> = Ieee<IeeePairLegacySemantics<S>>;
+
 pub type PpcDoubleDouble = IeeePair<ieee_semantics::IeeeDouble>;
+pub type PpcDoubleDoubleLegacy = IeeePairLegacy<ieee_semantics::IeeeDouble>;
+
+// These are legacy semantics for the fallback, inaccrurate implementation of
+// IBM double-double, if the accurate PpcDoubleDouble doesn't handle the
+// operation. It's equivalent to having an IEEE number with consecutive 106
+// bits of mantissa and 11 bits of exponent.
+//
+// It's not equivalent to IBM double-double. For example, a legit IBM
+// double-double, 1 + epsilon:
+//
+//   1 + epsilon = 1 + (1 >> 1076)
+//
+// is not representable by a consecutive 106 bits of mantissa.
+//
+// Currently, these semantics are used in the following way:
+//
+//   PpcDoubleDouble -> (IeeeDouble, IeeeDouble) ->
+//   (64 bits, 64 bits) -> (128 bits) ->
+//   PpcDoubleDoubleLegacy -> IEEE operations
+//
+// We use to_bits() to get the bit representation of the
+// underlying IeeeDouble, then construct the legacy IEEE float.
+//
+// FIXME: Implement all operations in PpcDoubleDouble, and delete these
+// semantics.
+impl<S: IeeeSemantics> IeeeSemantics for IeeePairLegacySemantics<S> {
+    const EXPONENT_BITS: usize = S::EXPONENT_BITS;
+    const MIN_EXPONENT: ExpInt = S::MIN_EXPONENT + (S::PRECISION as ExpInt);
+    const PRECISION: usize = S::PRECISION * 2;
+    const BITS: usize = S::BITS * 2;
+
+    fn from_bits(bits: u128) -> Ieee<Self> {
+        let mut loses_info = false;
+
+        // Get the first double and convert to our format.
+        let a = Ieee::<S>::from_bits(bits & ((1 << S::BITS) - 1));
+        let (a, fs) = a.convert(Round::NearestTiesToEven, &mut loses_info);
+        assert!(fs == OpStatus::OK && !loses_info);
+
+        // Unless we have a special case, add in second double.
+        if a.is_finite_non_zero() {
+            let b = Ieee::<S>::from_bits(bits >> S::BITS);
+            let (b, fs) = b.convert(Round::NearestTiesToEven, &mut loses_info);
+            assert!(fs == OpStatus::OK && !loses_info);
+
+            a + b
+        } else {
+            a
+        }
+    }
+
+    fn to_bits(x: Ieee<Self>) -> u128 {
+        #[derive(Debug)]
+        struct Extended<S: IeeeSemantics>(S);
+
+        // Convert number to double. To avoid spurious underflows, we re-
+        // normalize against the "double" MIN_EXPONENT first, and only *then*
+        // truncate the mantissa. The result of that second conversion
+        // may be inexact, but should never underflow.
+        impl<S: IeeeSemantics> IeeeSemantics for Extended<S> {
+            const EXPONENT_BITS: usize = S::EXPONENT_BITS;
+            const PRECISION: usize = S::PRECISION * 2;
+        }
+
+        let mut loses_info = false;
+        let (extended, fs) = x.convert::<Extended<S>>(Round::NearestTiesToEven, &mut loses_info);
+        assert!(fs == OpStatus::OK && !loses_info);
+
+        let (u, fs) = extended.convert(Round::NearestTiesToEven, &mut loses_info);
+        assert!(fs == OpStatus::OK || fs == OpStatus::INEXACT);
+        let a = Ieee::<S>::to_bits(u);
+
+        // If conversion was exact or resulted in a special case, we're done;
+        // just set the second double to zero. Otherwise, re-convert back to
+        // the extended format and compute the difference. This now should
+        // convert exactly to double.
+        let b = if u.is_finite_non_zero() && loses_info {
+            let (u, fs) = u.convert::<Extended<S>>(Round::NearestTiesToEven, &mut loses_info);
+            assert!(fs == OpStatus::OK && !loses_info);
+
+            let v = extended - u;
+            let (v, fs) = v.convert(Round::NearestTiesToEven, &mut loses_info);
+            assert!(fs == OpStatus::OK && !loses_info);
+            Ieee::<S>::to_bits(v)
+        } else {
+            0
+        };
+
+        a | (b << S::BITS)
+    }
+}
 
 proxy_impls!([S: IeeeSemantics] IeeePair<S>);
 
-#[allow(unused)]
-impl<S: IeeeSemantics> fmt::Display for IeeePair<S> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        panic!("NYI Display::fmt");
+impl<S: IeeeSemantics> PartialOrd for IeeePair<S> {
+    fn partial_cmp(&self, rhs: &Self) -> Option<Ordering> {
+        let result = self.0.partial_cmp(&rhs.0);
+        if result == Some(Ordering::Equal) {
+            return self.1.partial_cmp(&rhs.1);
+        }
+        result
     }
 }
 
-#[allow(unused)]
+impl<S: IeeeSemantics> fmt::Display for IeeePair<S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&IeeePairLegacy::<S>::from_bits(self.to_bits()), f)
+    }
+}
+
 impl<S: IeeeSemantics> Float for IeeePair<S> {
     fn zero() -> Self {
-        panic!("NYI zero")
+        IeeePair(Ieee::zero(), Ieee::zero())
     }
 
     fn inf() -> Self {
-        panic!("NYI inf")
+        IeeePair(Ieee::inf(), Ieee::zero())
     }
 
     fn qnan(payload: Option<u128>) -> Self {
-        panic!("NYI qnan")
+        IeeePair(Ieee::qnan(payload), Ieee::zero())
     }
 
     fn snan(payload: Option<u128>) -> Self {
-        panic!("NYI snan")
+        IeeePair(Ieee::snan(payload), Ieee::zero())
     }
 
     fn largest() -> Self {
-        panic!("NYI largest")
+        let mut r = IeeePair(Ieee::largest(), Ieee::largest());
+        r.1.exp -= S::PRECISION as ExpInt + 1;
+        r.1.sig[0] -= 1;
+        r
     }
 
     fn smallest() -> Self {
-        panic!("NYI smallest")
+        IeeePair(Ieee::smallest(), Ieee::zero())
     }
 
     fn smallest_normalized() -> Self {
-        panic!("NYI smallest_normalized")
+        let mut r = IeeePair(Ieee::smallest_normalized(), Ieee::zero());
+        r.0.exp += S::PRECISION as ExpInt;
+        r
     }
 
+    // Implement addition, subtraction, multiplication and division based on:
+    // "Software for Doubled-Precision Floating-Point Computations",
+    // by Seppo Linnainmaa, ACM TOMS vol 7 no 3, September 1981, pages 272-283.
+
     fn add_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
-        panic!("NYI add_rounded")
+        match (self.category(), rhs.category()) {
+            (Category::Infinity, Category::Infinity) => {
+                if self.is_negative() != rhs.is_negative() {
+                    *self = Self::nan().copy_sign(*self);
+                    OpStatus::INVALID_OP
+                } else {
+                    OpStatus::OK
+                }
+            }
+
+            (_, Category::Zero) |
+            (Category::NaN, _) |
+            (Category::Infinity, Category::Normal) => OpStatus::OK,
+
+            (Category::Zero, _) |
+            (_, Category::NaN) |
+            (_, Category::Infinity) => {
+                *self = rhs;
+                OpStatus::OK
+            }
+
+            (Category::Normal, Category::Normal) => {
+                let mut fs = OpStatus::OK;
+                let (a, aa, c, cc) = (self.0, self.1, rhs.0, rhs.1);
+                let mut z = a;
+                fs |= z.add_rounded(c, round);
+                if !z.is_finite() {
+                    if !z.is_infinite() {
+                        self.0 = z;
+                        self.1 = Ieee::zero();
+                        return fs;
+                    }
+                    fs = OpStatus::OK;
+                    let a_cmp_c = a.cmp_abs_normal(c);
+                    z = cc;
+                    fs |= z.add_rounded(aa, round);
+                    if a_cmp_c == Ordering::Greater {
+                        // z = cc + aa + c + a;
+                        fs |= z.add_rounded(c, round);
+                        fs |= z.add_rounded(a, round);
+                    } else {
+                        // z = cc + aa + a + c;
+                        fs |= z.add_rounded(a, round);
+                        fs |= z.add_rounded(c, round);
+                    }
+                    if !z.is_finite() {
+                        self.0 = z;
+                        self.1 = Ieee::zero();
+                        return fs;
+                    }
+                    self.0 = z;
+                    let mut zz = aa;
+                    fs |= zz.add_rounded(cc, round);
+                    if a_cmp_c == Ordering::Greater {
+                        // self.1 = a - z + c + zz;
+                        self.1 = a;
+                        fs |= self.1.sub_rounded(z, round);
+                        fs |= self.1.add_rounded(c, round);
+                        fs |= self.1.add_rounded(zz, round);
+                    } else {
+                        // self.1 = c - z + a + zz;
+                        self.1 = c;
+                        fs |= self.1.sub_rounded(z, round);
+                        fs |= self.1.add_rounded(a, round);
+                        fs |= self.1.add_rounded(zz, round);
+                    }
+                } else {
+                    // q = a - z;
+                    let mut q = a;
+                    fs |= q.sub_rounded(z, round);
+
+                    // zz = q + c + (a - (q + z)) + aa + cc;
+                    // Compute a - (q + z) as -((q + z) - a) to avoid temporary copies.
+                    let mut zz = q;
+                    fs |= zz.add_rounded(c, round);
+                    fs |= q.add_rounded(z, round);
+                    fs |= q.sub_rounded(a, round);
+                    q.change_sign();
+                    fs |= zz.add_rounded(q, round);
+                    fs |= zz.add_rounded(aa, round);
+                    fs |= zz.add_rounded(cc, round);
+                    if zz.is_zero() && !zz.is_negative() {
+                        self.0 = z;
+                        self.1 = Ieee::zero();
+                        return OpStatus::OK;
+                    }
+                    self.0 = z;
+                    fs |= self.0.add_rounded(zz, round);
+                    if !self.0.is_finite() {
+                        self.1 = Ieee::zero();
+                        return fs;
+                    }
+                    self.1 = z;
+                    fs |= self.1.sub_rounded(self.0, round);
+                    fs |= self.1.add_rounded(zz, round);
+                }
+                fs
+            }
+        }
     }
 
     fn mul_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
-        panic!("NYI mul_rounded")
+        // Interesting observation: For special categories, finding the lowest
+        // common ancestor of the following layered graph gives the correct
+        // return category:
+        //
+        //    NaN
+        //   /   \
+        // Zero  Inf
+        //   \   /
+        //   Normal
+        //
+        // e.g. NaN * NaN = NaN
+        //      Zero * Inf = NaN
+        //      Normal * Zero = Zero
+        //      Normal * Inf = Inf
+        match (self.category(), rhs.category()) {
+            (Category::NaN, _) => OpStatus::OK,
+
+            (_, Category::NaN) => {
+                *self = rhs;
+                OpStatus::OK
+            }
+
+            (Category::Zero, Category::Infinity) |
+            (Category::Infinity, Category::Zero) => {
+                *self = Self::nan();
+                OpStatus::OK
+            }
+
+            (Category::Zero, _) |
+            (Category::Infinity, _) => OpStatus::OK,
+
+            (_, Category::Zero) |
+            (_, Category::Infinity) => {
+                *self = rhs;
+                OpStatus::OK
+            }
+
+            (Category::Normal, Category::Normal) => {
+                let mut fs = OpStatus::OK;
+                let (a, b, c, d) = (self.0, self.1, rhs.0, rhs.1);
+                // t = a * c
+                let mut t = a;
+                fs |= t.mul_rounded(c, round);
+                if !t.is_finite_non_zero() {
+                    self.0 = t;
+                    self.1 = Ieee::zero();
+                    return fs;
+                }
+
+                // tau = fmsub(a, c, t), that is -fmadd(-a, c, t).
+                let mut tau = a;
+                t.change_sign();
+                fs |= tau.fused_mul_add(c, t, round);
+                t.change_sign();
+                // v = a * d
+                let mut v = a;
+                fs |= v.mul_rounded(d, round);
+                // w = b * c
+                let mut w = b;
+                fs |= w.mul_rounded(c, round);
+                fs |= v.add_rounded(w, round);
+                // tau += v + w
+                fs |= tau.add_rounded(v, round);
+                // u = t + tau
+                let mut u = t;
+                fs |= u.add_rounded(tau, round);
+
+                self.0 = u;
+                if !u.is_finite() {
+                    self.1 = Ieee::zero();
+                } else {
+                    // self.1 = (t - u) + tau
+                    fs |= t.sub_rounded(u, round);
+                    fs |= t.add_rounded(tau, round);
+                    self.1 = t;
+                }
+                fs
+            }
+        }
     }
 
     fn div_rounded(&mut self, rhs: Self, round: Round) -> OpStatus {
-        panic!("NYI div_rounded")
+        let mut lhs = IeeePairLegacy::<S>::from_bits(self.to_bits());
+        let rhs = IeeePairLegacy::<S>::from_bits(rhs.to_bits());
+        let fs = lhs.div_rounded(rhs, round);
+        *self = Self::from_bits(lhs.to_bits());
+        fs
     }
 
     fn remainder(&mut self, rhs: Self) -> OpStatus {
-        panic!("NYI remainder")
+        let mut lhs = IeeePairLegacy::<S>::from_bits(self.to_bits());
+        let rhs = IeeePairLegacy::<S>::from_bits(rhs.to_bits());
+        let fs = lhs.remainder(rhs);
+        *self = Self::from_bits(lhs.to_bits());
+        fs
     }
 
     fn modulo(&mut self, rhs: Self) -> OpStatus {
-        panic!("NYI modulo")
+        let mut lhs = IeeePairLegacy::<S>::from_bits(self.to_bits());
+        let rhs = IeeePairLegacy::<S>::from_bits(rhs.to_bits());
+        let fs = lhs.modulo(rhs);
+        *self = Self::from_bits(lhs.to_bits());
+        fs
     }
 
     fn fused_mul_add(&mut self, multiplicand: Self, addend: Self, round: Round) -> OpStatus {
-        panic!("NYI fused_mul_add")
+        let mut lhs = IeeePairLegacy::<S>::from_bits(self.to_bits());
+        let multiplicand = IeeePairLegacy::<S>::from_bits(multiplicand.to_bits());
+        let addend = IeeePairLegacy::<S>::from_bits(addend.to_bits());
+        let fs = lhs.fused_mul_add(multiplicand, addend, round);
+        *self = Self::from_bits(lhs.to_bits());
+        fs
     }
 
     fn round_to_integral(self, round: Round) -> (Self, OpStatus) {
-        panic!("NYI round_to_integral")
+        let (r, fs) = IeeePairLegacy::<S>::from_bits(self.to_bits()).round_to_integral(round);
+        (Self::from_bits(r.to_bits()), fs)
     }
 
     fn next_up(&mut self) -> OpStatus {
-        panic!("NYI next_up")
+        let mut lhs = IeeePairLegacy::<S>::from_bits(self.to_bits());
+        let fs = lhs.next_up();
+        *self = Self::from_bits(lhs.to_bits());
+        fs
     }
 
     fn change_sign(&mut self) {
-        panic!("NYI change_sign")
+        self.0.change_sign();
+        if self.1.is_finite_non_zero() {
+            self.1.change_sign();
+        }
     }
 
     fn from_bits(input: u128) -> Self {
-        panic!("NYI from_bits")
+        let (a, b) = (input, input >> S::BITS);
+        IeeePair(
+            Ieee::from_bits(a & ((1 << S::BITS) - 1)),
+            Ieee::from_bits(b & ((1 << S::BITS) - 1)),
+        )
     }
 
     fn from_u128(input: u128, round: Round) -> (Self, OpStatus) {
-        panic!("NYI from_u128")
+        let (r, fs) = IeeePairLegacy::<S>::from_u128(input, round);
+        (Self::from_bits(r.to_bits()), fs)
     }
 
     fn from_str_rounded(s: &str, round: Round) -> Result<(Self, OpStatus), ParseError> {
-        panic!("NYI from_str_rounded")
+        IeeePairLegacy::<S>::from_str_rounded(s, round).map(
+            |(r, fs)| {
+                (Self::from_bits(r.to_bits()), fs)
+            },
+        )
     }
 
     fn to_bits(self) -> u128 {
-        panic!("NYI to_bits")
+        self.0.to_bits() | (self.1.to_bits() << S::BITS)
     }
 
     fn to_u128(self, width: usize, round: Round, is_exact: &mut bool) -> (u128, OpStatus) {
-        panic!("NYI to_u128");
+        IeeePairLegacy::<S>::from_bits(self.to_bits()).to_u128(width, round, is_exact)
     }
 
     fn cmp_abs_normal(self, rhs: Self) -> Ordering {
-        panic!("NYI cmp_abs_normal")
+        self.0.cmp_abs_normal(rhs.0).then_with(|| {
+            let result = self.1.cmp_abs_normal(rhs.1);
+            if result != Ordering::Equal {
+                let against = self.0.sign ^ self.1.sign;
+                let rhs_against = rhs.0.sign ^ rhs.1.sign;
+                (!against).cmp(&!rhs_against).then_with(|| if against {
+                    result.reverse()
+                } else {
+                    result
+                })
+            } else {
+                result
+            }
+        })
     }
 
     fn bitwise_eq(self, rhs: Self) -> bool {
-        panic!("NYI bitwise_eq")
+        self.0.bitwise_eq(rhs.0) && self.1.bitwise_eq(rhs.1)
     }
 
     fn is_negative(self) -> bool {
-        panic!("NYI is_negative")
+        self.0.is_negative()
     }
 
     fn is_denormal(self) -> bool {
-        panic!("NYI is_denormal")
+        self.category() == Category::Normal &&
+            (self.0.is_denormal() || self.0.is_denormal() ||
+          // (double)(Hi + Lo) == Hi defines a normal number.
+          (self.0 + self.1).partial_cmp(&self.0) != Some(Ordering::Equal))
     }
 
     fn is_signaling(self) -> bool {
-        panic!("NYI is_signaling")
+        self.0.is_signaling()
     }
 
     fn category(self) -> Category {
-        panic!("NYI category")
+        self.0.category()
     }
 
     fn is_smallest(self) -> bool {
-        panic!("NYI is_smallest")
+        Self::smallest().copy_sign(self).partial_cmp(&self) == Some(Ordering::Equal)
     }
 
     fn is_largest(self) -> bool {
-        panic!("NYI is_largest")
+        Self::largest().copy_sign(self).partial_cmp(&self) == Some(Ordering::Equal)
     }
 
     fn is_integer(self) -> bool {
-        panic!("NYI is_integer")
+        self.0.is_integer() && self.1.is_integer()
     }
 
     fn get_exact_inverse(self) -> Option<Self> {
-        panic!("NYI get_exact_inverse")
+        let r = IeeePairLegacy::<S>::from_bits(self.to_bits()).get_exact_inverse();
+        r.map(|r| Self::from_bits(r.to_bits()))
     }
 
     fn ilogb(self) -> i32 {
-        panic!("NYI ilogb")
+        self.0.ilogb()
     }
 
     fn scalbn(self, exp: i32, round: Round) -> Self {
-        panic!("NYI scalbn")
+        IeeePair(self.0.scalbn(exp, round), self.1.scalbn(exp, round))
     }
 
     fn frexp(self, exp: &mut i32, round: Round) -> Self {
-        panic!("NYI frexp")
+        let a = self.0.frexp(exp, round);
+        let mut b = self.1;
+        if self.category() == Category::Normal {
+            b = b.scalbn(-*exp, round);
+        }
+        IeeePair(a, b)
     }
 }
 
@@ -2037,7 +4881,12 @@ mod tests {
     #[test]
     fn to_string() {
         let to_string = |d: f64, precision: usize, width: usize| {
-            format!("{:2$.1$}", IeeeDouble::from_f64(d), precision, width)
+            let x = IeeeDouble::from_f64(d);
+            if precision == 0 {
+                format!("{:1$}", x, width)
+            } else {
+                format!("{:2$.1$}", x, precision, width)
+            }
         };
         assert_eq!("10", to_string(10.0, 6, 3));
         assert_eq!("1.0E+1", to_string(10.0, 6, 0));
@@ -2063,7 +4912,12 @@ mod tests {
         );
 
         let to_string = |d: f64, precision: usize, width: usize| {
-            format!("{:#2$.1$}", IeeeDouble::from_f64(d), precision, width)
+            let x = IeeeDouble::from_f64(d);
+            if precision == 0 {
+                format!("{:#1$}", x, width)
+            } else {
+                format!("{:#2$.1$}", x, precision, width)
+            }
         };
         assert_eq!("10", to_string(10.0, 6, 3));
         assert_eq!("1.000000e+01", to_string(10.0, 6, 0));
