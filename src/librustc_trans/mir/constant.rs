@@ -27,7 +27,7 @@ use abi::{self, Abi};
 use callee;
 use builder::Builder;
 use common::{self, CrateContext, const_get_elt, val_ty};
-use common::{C_array, C_bool, C_bytes, C_floating_f64, C_integral, C_big_integral};
+use common::{C_array, C_bool, C_bytes, C_integral, C_big_integral};
 use common::{C_null, C_struct, C_str_slice, C_undef, C_uint, C_vector, is_undef};
 use common::const_to_opt_u128;
 use consts;
@@ -96,11 +96,11 @@ impl<'tcx> Const<'tcx> {
         let llty = type_of::type_of(ccx, ty);
         let val = match cv {
             ConstVal::Float(v) => {
-                let v_f64 = match v {
-                    ConstFloat::F32(v) => f32::from_bits(v) as f64,
-                    ConstFloat::F64(v) => f64::from_bits(v)
+                let bits = match v {
+                    ConstFloat::F32(v) => U32(v),
+                    ConstFloat::F64(v) => U64(v)
                 };
-                C_floating_f64(v_f64, llty)
+                consts::bitcast(Const::from_constint(ccx, &bits).llval, llty)
             }
             ConstVal::Bool(v) => C_bool(ccx, v),
             ConstVal::Integral(ref i) => return Const::from_constint(ccx, i),
