@@ -11,7 +11,7 @@
 use llvm::{self, ValueRef};
 use rustc::middle::const_val::{ConstEvalErr, ConstVal, ErrKind};
 use rustc_const_math::ConstInt::*;
-use rustc_const_math::ConstFloat::*;
+use rustc_const_math::ConstFloat;
 use rustc_const_math::{ConstInt, ConstMathErr};
 use rustc::hir::def_id::DefId;
 use rustc::infer::TransNormalize;
@@ -27,7 +27,7 @@ use abi::{self, Abi};
 use callee;
 use builder::Builder;
 use common::{self, CrateContext, const_get_elt, val_ty};
-use common::{C_array, C_bool, C_bytes, C_floating_f64, C_integral, C_big_integral};
+use common::{C_array, C_bool, C_bytes, C_integral, C_big_integral};
 use common::{C_null, C_struct, C_str_slice, C_undef, C_uint, C_vector, is_undef};
 use common::const_to_opt_u128;
 use consts;
@@ -95,8 +95,13 @@ impl<'tcx> Const<'tcx> {
                              -> Const<'tcx> {
         let llty = type_of::type_of(ccx, ty);
         let val = match cv {
-            ConstVal::Float(F32(v)) => C_floating_f64(v as f64, llty),
-            ConstVal::Float(F64(v)) => C_floating_f64(v, llty),
+            ConstVal::Float(v) => {
+                let bits = match v {
+                    ConstFloat::F32(v) => U32(v),
+                    ConstFloat::F64(v) => U64(v)
+                };
+                consts::bitcast(Const::from_constint(ccx, &bits).llval, llty)
+            }
             ConstVal::Bool(v) => C_bool(ccx, v),
             ConstVal::Integral(ref i) => return Const::from_constint(ccx, i),
             ConstVal::Str(ref v) => C_str_slice(ccx, v.clone()),

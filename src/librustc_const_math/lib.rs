@@ -25,11 +25,18 @@
 #![feature(const_fn)]
 #![feature(i128)]
 #![feature(i128_type)]
+#![feature(slice_patterns)]
+#![feature(try_from)]
 
 extern crate syntax;
 
 extern crate serialize as rustc_serialize; // used by deriving
 
+#[macro_use]
+#[no_link]
+extern crate rustc_bitflags;
+
+pub mod apfloat;
 mod float;
 mod int;
 mod us;
